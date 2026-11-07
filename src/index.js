@@ -54,7 +54,8 @@ const commands = [
     .addAttachmentOption(o => o.setName('big_thumbnail').setDescription('Large image; used if image is omitted').setRequired(false))
     .addAttachmentOption(o => o.setName('small_thumbnail').setDescription('Small right-side thumbnail').setRequired(false))
     .addAttachmentOption(o => o.setName('footer_thumbnail').setDescription('Small icon beside the footer').setRequired(false))
-    .addStringOption(o => o.setName('link').setDescription('Optional HTTP/HTTPS link button below the embed').setMaxLength(512).setRequired(false)),
+    .addStringOption(o => o.setName('link').setDescription('Optional HTTP/HTTPS link button below the embed').setMaxLength(512).setRequired(false))
+    .addStringOption(o => o.setName('link_title').setDescription('Optional title for the link button (max 80 characters)').setMinLength(1).setMaxLength(80).setRequired(false)),
   new SlashCommandBuilder().setName('automod').setDescription('Configure automatic flag-word moderation for one channel.')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addChannelOption(o => o.setName('channel').setDescription('Channel to monitor').addChannelTypes(ChannelType.GuildText).setRequired(true))
@@ -112,12 +113,14 @@ async function handleEmbed(interaction) {
   const footer = interaction.options.getString('footer');
   if (footer || footerIcon) embed.setFooter({ text: footer || '\u200b', ...(footerIcon ? { iconURL: footerIcon } : {}) });
   const link = interaction.options.getString('link')?.trim();
+  const linkTitle = interaction.options.getString('link_title')?.trim();
+  if (linkTitle && !link) return interaction.reply({ content: 'Set the `link` option too, so I have a URL for that button title.', ephemeral: true });
   let linkButton;
   if (link) {
     try {
       const url = new URL(link);
       if (!['http:', 'https:'].includes(url.protocol)) throw new Error('Unsupported URL protocol');
-      linkButton = new ButtonBuilder().setLabel('Open Link').setStyle(ButtonStyle.Link).setURL(url.toString());
+      linkButton = new ButtonBuilder().setLabel(linkTitle || 'Open Link').setStyle(ButtonStyle.Link).setURL(url.toString());
     } catch {
       return interaction.reply({ content: 'Link must be a valid HTTP or HTTPS URL.', ephemeral: true });
     }
