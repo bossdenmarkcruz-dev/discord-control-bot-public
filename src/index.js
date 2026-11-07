@@ -84,10 +84,10 @@ const commands = [
     .addAttachmentOption(o => o.setName('small_thumbnail').setDescription('Small right-side thumbnail').setRequired(false))
     .addStringOption(o => o.setName('footer').setDescription('Optional embed footer text').setMaxLength(2048).setRequired(false))
     .addAttachmentOption(o => o.setName('footer_thumbnail').setDescription('Small icon beside the footer').setRequired(false))
-    .addStringOption(o => o.setName('dashboard_link').setDescription('Optional dashboard URL').setMaxLength(512).setRequired(false))
-    .addStringOption(o => o.setName('rules_link').setDescription('Optional server rules URL').setMaxLength(512).setRequired(false))
-    .addStringOption(o => o.setName('tutorial_link').setDescription('Optional getting-started tutorial URL').setMaxLength(512).setRequired(false))
-    .addStringOption(o => o.setName('methods_link').setDescription('Optional methods URL').setMaxLength(512).setRequired(false)),
+    .addChannelOption(o => o.setName('dashboard_channel').setDescription('Optional Discord channel for your dashboard').addChannelTypes(ChannelType.GuildText).setRequired(false))
+    .addChannelOption(o => o.setName('rules_channel').setDescription('Optional Discord channel for server rules').addChannelTypes(ChannelType.GuildText).setRequired(false))
+    .addChannelOption(o => o.setName('tutorial_channel').setDescription('Optional Discord channel for tutorials').addChannelTypes(ChannelType.GuildText).setRequired(false))
+    .addChannelOption(o => o.setName('methods_channel').setDescription('Optional Discord channel for methods').addChannelTypes(ChannelType.GuildText).setRequired(false)),
 ].map(c => c.toJSON());
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
@@ -145,32 +145,16 @@ async function handleEmbed(interaction) {
   await interaction.reply({ content: 'Embed sent to this channel.', ephemeral: true });
 }
 
-function parseWebUrl(value, label) {
-  if (!value) return null;
-  try {
-    const url = new URL(value.trim());
-    if (!['http:', 'https:'].includes(url.protocol)) throw new Error('Unsupported protocol');
-    return url.toString();
-  } catch {
-    throw new Error(`${label} must be a valid HTTP or HTTPS URL.`);
-  }
-}
-
 async function handleWelcomer(interaction) {
   if (!canManageGuild(interaction.member)) return interaction.reply({ content: 'You need Manage Server permission to configure the welcomer.', ephemeral: true });
   const colorText = interaction.options.getString('embed_color', true).trim().replace(/^#/, '');
   if (!/^[0-9a-fA-F]{6}$/.test(colorText)) return interaction.reply({ content: 'Embed color must be six-digit hex, such as `#5865F2`.', ephemeral: true });
-  let links;
-  try {
-    links = {
-      dashboard: parseWebUrl(interaction.options.getString('dashboard_link'), 'Dashboard link'),
-      rules: parseWebUrl(interaction.options.getString('rules_link'), 'Rules link'),
-      tutorial: parseWebUrl(interaction.options.getString('tutorial_link'), 'Tutorial link'),
-      methods: parseWebUrl(interaction.options.getString('methods_link'), 'Methods link'),
-    };
-  } catch (error) {
-    return interaction.reply({ content: error.message, ephemeral: true });
-  }
+  const links = {
+    dashboard: interaction.options.getChannel('dashboard_channel')?.id ?? null,
+    rules: interaction.options.getChannel('rules_channel')?.id ?? null,
+    tutorial: interaction.options.getChannel('tutorial_channel')?.id ?? null,
+    methods: interaction.options.getChannel('methods_channel')?.id ?? null,
+  };
   const channel = interaction.options.getChannel('channel', true);
   const config = {
     color: Number.parseInt(colorText, 16),
@@ -184,7 +168,7 @@ async function handleWelcomer(interaction) {
     ON CONFLICT(guild_id) DO UPDATE SET channel_id=excluded.channel_id, config_json=excluded.config_json`)
     .run(interaction.guildId, channel.id, JSON.stringify(config));
   const selectedLinks = Object.values(links).filter(Boolean).length;
-  await interaction.reply({ content: `Welcomer configured for <#${channel.id}> with ${selectedLinks} optional link button${selectedLinks === 1 ? '' : 's'}. Enable Server Members Intent in the Discord Developer Portal to receive join events.`, ephemeral: true });
+  await interaction.reply({ content: `Welcomer configured for <#${channel.id}> with ${selectedLinks} optional channel mention${selectedLinks === 1 ? '' : 's'}. Enable Server Members Intent in the Discord Developer Portal to receive join events.`, ephemeral: true });
 }
 
 function ordinal(number) {
@@ -252,7 +236,8 @@ async function sendWelcome(member) {
     ['Join Tutorial If You’re New', config.links.tutorial],
     ['OP Leaked Methods Join Now', config.links.methods],
   ];
-  const linkFields = linkDefinitions.filter(([, url]) => url).map(([name, url]) => ({ name, value: `\`${url}\``, inline: false }));
+  const linkFields = linkDefinitions.filter(([, channelId]) => typeof channelId === 'string' && /^\d{17,20}$/.test(channelId))
+    .map(([name, channelId]) => ({ name, value: `<#${channelId}>`, inline: false }));
   if (linkFields.length) embed.addFields(linkFields);
   await channel.send({ embeds: [embed] });
 }
