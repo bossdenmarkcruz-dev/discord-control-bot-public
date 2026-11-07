@@ -350,22 +350,18 @@ async function handleTicketButton(interaction) {
   }
   if (interaction.customId === 'ticket:close') {
     if (!isAdmin(interaction.member)) return interaction.reply({ content: 'Only server administrators can close tickets.', ephemeral: true });
-    await interaction.deferReply();
+    await interaction.deferReply({ ephemeral: true });
+    const closing = db.prepare("UPDATE tickets SET status = 'closing' WHERE channel_id = ? AND status = 'open'").run(interaction.channelId);
+    if (!closing.changes) return interaction.editReply('This ticket is already closing or closed.');
     try {
-      await interaction.channel.permissionOverwrites.edit(ticket.creator_id, { SendMessages: false, AddReactions: false });
-      await interaction.channel.setName(`closed-${interaction.channel.name}`.slice(0, 100));
-      db.prepare("UPDATE tickets SET status = 'closed' WHERE channel_id = ?").run(interaction.channelId);
-      await interaction.editReply('Ticket closed and made read-only. It remains visible to the creator and server administrators for reference.');
-      const claimed = ticket.claimed_by ? `Claimed by ${interaction.guild.members.cache.get(ticket.claimed_by)?.user.username || 'admin'}` : 'Closed';
-      const disabled = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId('ticket:claimed').setLabel(claimed).setStyle(ButtonStyle.Secondary).setDisabled(true),
-        new ButtonBuilder().setCustomId('ticket:closed').setLabel('Closed').setStyle(ButtonStyle.Secondary).setDisabled(true),
-      );
-      await interaction.message.edit({ components: [disabled] }).catch(() => {});
+      await interaction.channel.delete(`Ticket closed by ${interaction.user.tag}`);
     } catch (error) {
       console.error('Ticket close failed:', error);
-      await interaction.editReply('Could not close the ticket. Check Manage Channels permission and the bot role position.');
+      db.prepare("UPDATE tickets SET status = 'open' WHERE channel_id = ? AND status = 'closing'").run(interaction.channelId);
+      return interaction.editReply('Could not delete this ticket channel. Check the bot’s Manage Channels permission and role position.');
     }
+    db.prepare("UPDATE tickets SET status = 'closed' WHERE channel_id = ? AND status = 'closing'").run(interaction.channelId);
+    await interaction.editReply('Ticket closed and its channel deleted.');
   }
 }
 
