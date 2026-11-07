@@ -334,7 +334,7 @@ async function openTicket(interaction, selectedRoleId = null) {
   );
   const roleIdsToMention = [...new Set([...adminRoleIds, ...(supportRole ? [supportRole.id] : [])])];
   const supportMention = supportRole ? ` ${supportRole}` : '';
-  await channel.send({ content: `${adminMentions(interaction.guild)}${supportMention}\n${interaction.user}, your ticket is open. A server administrator will assist you.`, components: [row],
+  await channel.send({ content: `${adminMentions(interaction.guild)}${supportMention}\n${interaction.user}, your ticket is open. A server administrator will assist you.\n\nAdministrators: use the buttons below to claim or close this ticket.`, components: [row],
     allowedMentions: { parse: [], users: [interaction.guild.ownerId, interaction.user.id], roles: roleIdsToMention } });
   await interaction.editReply(`Your private ticket is ready: <#${channel.id}>.`);
 }
@@ -349,7 +349,7 @@ async function handleTicketButton(interaction) {
     return interaction.reply({ content: `Ticket claimed by ${interaction.user}.` });
   }
   if (interaction.customId === 'ticket:close') {
-    if (!isAdmin(interaction.member) && interaction.user.id !== ticket.creator_id) return interaction.reply({ content: 'Only the creator or a server administrator can close this ticket.', ephemeral: true });
+    if (!isAdmin(interaction.member)) return interaction.reply({ content: 'Only server administrators can close tickets.', ephemeral: true });
     await interaction.deferReply();
     try {
       await interaction.channel.permissionOverwrites.edit(ticket.creator_id, { SendMessages: false, AddReactions: false });
