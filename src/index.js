@@ -53,7 +53,8 @@ const commands = [
     .addStringOption(o => o.setName('footer').setDescription('Optional footer text').setMaxLength(2048).setRequired(false))
     .addAttachmentOption(o => o.setName('big_thumbnail').setDescription('Large image; used if image is omitted').setRequired(false))
     .addAttachmentOption(o => o.setName('small_thumbnail').setDescription('Small right-side thumbnail').setRequired(false))
-    .addAttachmentOption(o => o.setName('footer_thumbnail').setDescription('Small icon beside the footer').setRequired(false)),
+    .addAttachmentOption(o => o.setName('footer_thumbnail').setDescription('Small icon beside the footer').setRequired(false))
+    .addStringOption(o => o.setName('link').setDescription('Optional HTTP/HTTPS link button below the embed').setMaxLength(512).setRequired(false)),
   new SlashCommandBuilder().setName('automod').setDescription('Configure automatic flag-word moderation for one channel.')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addChannelOption(o => o.setName('channel').setDescription('Channel to monitor').addChannelTypes(ChannelType.GuildText).setRequired(true))
@@ -68,7 +69,9 @@ const commands = [
   new SlashCommandBuilder().setName('ticket').setDescription('Post a ticket panel in a channel.')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addChannelOption(o => o.setName('channel').setDescription('Channel for the ticket panel').addChannelTypes(ChannelType.GuildText).setRequired(true))
-    .addStringOption(o => o.setName('message').setDescription('Message above the open-ticket button').setMaxLength(2000).setRequired(true)),
+    .addStringOption(o => o.setName('message').setDescription('Message above the open-ticket button').setMaxLength(2000).setRequired(true))
+    .addBooleanOption(o => o.setName('embed').setDescription('Show the panel message in an embed').setRequired(false))
+    .addRoleOption(o => o.setName('mention_role').setDescription('Support role to mention and allow into tickets').setRequired(false)),
 ].map(c => c.toJSON());
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
@@ -79,9 +82,19 @@ const escapeText = value => value.replace(/([_*`~|>])/g, '\\$1');
 
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(token);
-  const route = guildId ? Routes.applicationGuildCommands(clientId, guildId) : Routes.applicationCommands(clientId);
-  await rest.put(route, { body: commands });
-  console.log(`Registered ${commands.length} commands ${guildId ? `in guild ${guildId}` : 'globally'}.`);
+  const globalRoute = Routes.applicationCommands(clientId);
+  if (guildId) {
+    // Remove any old global copies so a guild-scoped install shows each command only once.
+    await rest.put(globalRoute, { body: [] });
+    await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body: commands });
+  } else {
+    // Remove old guild-scoped copies before publishing the global command set.
+    for (const guild of client.guilds.cache.values()) {
+      await rest.put(Routes.applicationGuildCommands(clientId, guild.id), { body: [] });
+    }
+    await rest.put(globalRoute, { body: commands });
+  }
+  console.log(`Registered ${commands.length} commands ${guildId ? `in guild ${guildId} (global copies cleared)` : 'globally (guild copies cleared)'}.`);
 }
 const imageUrl = (interaction, name) => interaction.options.getAttachment(name)?.url;
 
@@ -98,7 +111,18 @@ async function handleEmbed(interaction) {
   if (thumb) embed.setThumbnail(thumb);
   const footer = interaction.options.getString('footer');
   if (footer || footerIcon) embed.setFooter({ text: footer || '\u200b', ...(footerIcon ? { iconURL: footerIcon } : {}) });
-  await interaction.channel.send({ embeds: [embed] });
+  const link = interaction.options.getString('link')?.trim();
+  let linkButton;
+  if (link) {
+    try {
+      const url = new URL(link);
+      if (!['http:', 'https:'].includes(url.protocol)) throw new Error('Unsupported URL protocol');
+      linkButton = new ButtonBuilder().setLabel('Open Link').setStyle(ButtonStyle.Link).setURL(url.toString());
+    } catch {
+      return interaction.reply({ content: 'Link must be a valid HTTP or HTTPS URL.', ephemeral: true });
+    }
+  }
+  await interaction.channel.send({ embeds: [embed], ...(linkButton ? { components: [new ActionRowBuilder().addComponents(linkButton)] } : {}) });
   await interaction.reply({ content: 'Embed sent to this channel.', ephemeral: true });
 }
 
@@ -143,12 +167,18 @@ function adminMentions(guild) {
 async function handleTicketPanel(interaction) {
   if (!canManageGuild(interaction.member)) return interaction.reply({ content: 'You need Manage Server permission to post a ticket panel.', ephemeral: true });
   const channel = interaction.options.getChannel('channel', true);
-  await channel.send({ content: interaction.options.getString('message', true), components: [
-    new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('ticket:open').setLabel('Open Ticket For Inquiries').setStyle(ButtonStyle.Primary)),
-  ] });
+  const message = interaction.options.getString('message', true);
+  const useEmbed = interaction.options.getBoolean('embed') ?? false;
+  const mentionRole = interaction.options.getRole('mention_role');
+  if (mentionRole?.id === interaction.guild.roles.everyone.id) return interaction.reply({ content: 'Choose a support role, not @everyone.', ephemeral: true });
+  const button = new ButtonBuilder().setCustomId(`ticket:open:${mentionRole?.id ?? 'none'}`).setLabel('Open Ticket For Inquiries').setStyle(ButtonStyle.Primary);
+  const panel = { components: [new ActionRowBuilder().addComponents(button)] };
+  if (useEmbed) panel.embeds = [new EmbedBuilder().setColor(0x5865F2).setTitle('Support & Inquiries').setDescription(message)];
+  else panel.content = message;
+  await channel.send(panel);
   await interaction.reply({ content: `Ticket panel posted in <#${channel.id}>.`, ephemeral: true });
 }
-async function openTicket(interaction) {
+async function openTicket(interaction, selectedRoleId = null) {
   await interaction.deferReply({ ephemeral: true });
   const prior = db.prepare("SELECT channel_id FROM tickets WHERE guild_id = ? AND creator_id = ? AND status = 'open' ORDER BY id DESC LIMIT 1").get(interaction.guildId, interaction.user.id);
   if (prior) {
@@ -159,11 +189,15 @@ async function openTicket(interaction) {
   const result = db.prepare('INSERT INTO tickets(guild_id, channel_id, creator_id, created_at) VALUES(?, NULL, ?, ?)').run(interaction.guildId, interaction.user.id, Date.now());
   const ticketId = Number(result.lastInsertRowid);
   const name = `ticket-${String(ticketId).padStart(4, '0')}`;
+  const supportRole = selectedRoleId && selectedRoleId !== 'none' ? interaction.guild.roles.cache.get(selectedRoleId) : null;
   const overwrite = [
     { id: interaction.guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
     { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles, PermissionFlagsBits.EmbedLinks] },
     { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageChannels, PermissionFlagsBits.ManageMessages] },
   ];
+  if (supportRole && supportRole.id !== interaction.guild.roles.everyone.id) {
+    overwrite.push({ id: supportRole.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles, PermissionFlagsBits.EmbedLinks] });
+  }
   let channel;
   try {
     channel = await interaction.guild.channels.create({
@@ -182,12 +216,15 @@ async function openTicket(interaction) {
     new ButtonBuilder().setCustomId('ticket:claim').setLabel('Claim Ticket').setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId('ticket:close').setLabel('Close Ticket').setStyle(ButtonStyle.Danger),
   );
-  await channel.send({ content: `${adminMentions(interaction.guild)}\n${interaction.user}, your ticket is open. A server administrator will assist you.`, components: [row],
-    allowedMentions: { users: [interaction.guild.ownerId, interaction.user.id], roles: adminRoleIds } });
+  const roleIdsToMention = [...new Set([...adminRoleIds, ...(supportRole ? [supportRole.id] : [])])];
+  const supportMention = supportRole ? ` ${supportRole}` : '';
+  await channel.send({ content: `${adminMentions(interaction.guild)}${supportMention}\n${interaction.user}, your ticket is open. A server administrator will assist you.`, components: [row],
+    allowedMentions: { parse: [], users: [interaction.guild.ownerId, interaction.user.id], roles: roleIdsToMention } });
   await interaction.editReply(`Your private ticket is ready: <#${channel.id}>.`);
 }
 async function handleTicketButton(interaction) {
   if (interaction.customId === 'ticket:open') return openTicket(interaction);
+  if (interaction.customId.startsWith('ticket:open:')) return openTicket(interaction, interaction.customId.slice('ticket:open:'.length));
   const ticket = db.prepare('SELECT * FROM tickets WHERE channel_id = ?').get(interaction.channelId);
   if (!ticket || ticket.status !== 'open') return interaction.reply({ content: 'This ticket is no longer open.', ephemeral: true });
   if (interaction.customId === 'ticket:claim') {
