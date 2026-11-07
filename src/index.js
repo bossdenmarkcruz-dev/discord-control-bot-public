@@ -239,8 +239,10 @@ async function sendWelcome(member) {
   if (!channel?.isTextBased()) return;
   const config = JSON.parse(row.config_json);
   const inviter = await findJoiningInvite(member);
-  const content = `Welcome To Our Server ${member}\nYou're Our ${ordinal(member.guild.memberCount)} Member On Our Server\nInvited by ${inviter ? `<@${inviter.id}>` : 'Unknown (invite could not be identified)'}`;
-  const embed = new EmbedBuilder().setColor(config.color).setTitle('Welcome to our server!');
+  const memberName = member.displayName || member.user.username;
+  const inviterName = inviter ? (inviter.globalName || inviter.username) : null;
+  const description = `Welcome To Our Server @${memberName}\nYou're Our ${ordinal(member.guild.memberCount)} Member On Our Server\nInvited by ${inviterName ? `@${inviterName}` : 'Unknown (invite could not be identified)'}`;
+  const embed = new EmbedBuilder().setColor(config.color).setTitle('Welcome to our server!').setDescription(description);
   if (config.bigThumbnail) embed.setImage(config.bigThumbnail);
   if (config.smallThumbnail) embed.setThumbnail(config.smallThumbnail);
   if (config.footer || config.footerThumbnail) embed.setFooter({ text: config.footer || '\u200b', ...(config.footerThumbnail ? { iconURL: config.footerThumbnail } : {}) });
@@ -250,8 +252,9 @@ async function sendWelcome(member) {
     ['Join Tutorial If You’re New', config.links.tutorial],
     ['OP Leaked Methods Join Now', config.links.methods],
   ];
-  const buttons = linkDefinitions.filter(([, url]) => url).map(([label, url]) => new ButtonBuilder().setLabel(label).setStyle(ButtonStyle.Link).setURL(url));
-  await channel.send({ content, embeds: [embed], ...(buttons.length ? { components: [new ActionRowBuilder().addComponents(buttons)] } : {}), allowedMentions: { parse: [], users: [member.id, ...(inviter ? [inviter.id] : [])] } });
+  const linkFields = linkDefinitions.filter(([, url]) => url).map(([name, url]) => ({ name, value: `\`${url}\``, inline: false }));
+  if (linkFields.length) embed.addFields(linkFields);
+  await channel.send({ embeds: [embed] });
 }
 
 async function handleAutoMod(interaction) {
