@@ -47,9 +47,9 @@ const punishments = [
 const commands = [
   new SlashCommandBuilder().setName('embed').setDescription('Create and send a formatted embed in this channel.')
     .addStringOption(o => o.setName('bot_name').setDescription('Embed title or bot name').setMaxLength(256).setRequired(true))
-    .addAttachmentOption(o => o.setName('image').setDescription('Main image or photo').setRequired(false))
     .addStringOption(o => o.setName('color').setDescription('Embed color as hex, e.g. #5865F2').setMaxLength(7).setRequired(true))
     .addStringOption(o => o.setName('message').setDescription('Embed message').setMaxLength(4000).setRequired(true))
+    .addAttachmentOption(o => o.setName('image').setDescription('Main image or photo').setRequired(false))
     .addStringOption(o => o.setName('footer').setDescription('Optional footer text').setMaxLength(2048).setRequired(false))
     .addAttachmentOption(o => o.setName('big_thumbnail').setDescription('Large image; used if image is omitted').setRequired(false))
     .addAttachmentOption(o => o.setName('small_thumbnail').setDescription('Small right-side thumbnail').setRequired(false))
