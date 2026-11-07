@@ -35,6 +35,16 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS welcome_settings (
     guild_id TEXT PRIMARY KEY, channel_id TEXT NOT NULL, config_json TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS invite_stats (
+    guild_id TEXT NOT NULL, inviter_id TEXT NOT NULL,
+    invited_count INTEGER NOT NULL DEFAULT 0, left_count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (guild_id, inviter_id)
+  );
+  CREATE TABLE IF NOT EXISTS invite_attribution (
+    guild_id TEXT NOT NULL, member_id TEXT NOT NULL, inviter_id TEXT,
+    is_present INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (guild_id, member_id)
+  );
 `);
 
 const durations = [
@@ -88,10 +98,13 @@ const commands = [
     .addChannelOption(o => o.setName('rules_channel').setDescription('Optional Discord channel for server rules').addChannelTypes(ChannelType.GuildText).setRequired(false))
     .addChannelOption(o => o.setName('tutorial_channel').setDescription('Optional Discord channel for tutorials').addChannelTypes(ChannelType.GuildText).setRequired(false))
     .addChannelOption(o => o.setName('methods_channel').setDescription('Optional Discord channel for methods').addChannelTypes(ChannelType.GuildText).setRequired(false)),
+  new SlashCommandBuilder().setName('invites').setDescription('Show the tracked invites for a server member.')
+    .addUserOption(o => o.setName('user').setDescription('Member whose invite totals you want to check').setRequired(true)),
 ].map(c => c.toJSON());
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
 const inviteSnapshots = new Map();
+const inviteJoinQueues = new Map();
 const isAdmin = member => Boolean(member?.permissions?.has(PermissionFlagsBits.Administrator));
 const canManageGuild = member => Boolean(member?.permissions?.has(PermissionFlagsBits.ManageGuild) || isAdmin(member));
 const hasPermission = (member, permission) => Boolean(member?.permissions?.has(permission) || isAdmin(member));
@@ -171,6 +184,53 @@ async function handleWelcomer(interaction) {
   await interaction.reply({ content: `Welcomer configured for <#${channel.id}> with ${selectedLinks} optional channel mention${selectedLinks === 1 ? '' : 's'}. Enable Server Members Intent in the Discord Developer Portal to receive join events.`, ephemeral: true });
 }
 
+function recordInviteJoin(member, inviterId) {
+  db.transaction(() => {
+    if (inviterId) {
+      db.prepare(`INSERT INTO invite_stats(guild_id, inviter_id, invited_count, left_count) VALUES(?, ?, 1, 0)
+        ON CONFLICT(guild_id, inviter_id) DO UPDATE SET invited_count=invite_stats.invited_count + 1`)
+        .run(member.guild.id, inviterId);
+    }
+    db.prepare(`INSERT INTO invite_attribution(guild_id, member_id, inviter_id, is_present) VALUES(?, ?, ?, 1)
+      ON CONFLICT(guild_id, member_id) DO UPDATE SET inviter_id=excluded.inviter_id, is_present=1`)
+      .run(member.guild.id, member.id, inviterId ?? null);
+  })();
+}
+
+function recordInviteLeave(member) {
+  db.transaction(() => {
+    const attribution = db.prepare('SELECT inviter_id, is_present FROM invite_attribution WHERE guild_id = ? AND member_id = ?').get(member.guild.id, member.id);
+    if (!attribution || !attribution.is_present) return;
+    if (attribution.inviter_id) {
+      db.prepare(`INSERT INTO invite_stats(guild_id, inviter_id, invited_count, left_count) VALUES(?, ?, 0, 1)
+        ON CONFLICT(guild_id, inviter_id) DO UPDATE SET left_count=invite_stats.left_count + 1`)
+        .run(member.guild.id, attribution.inviter_id);
+    }
+    db.prepare('UPDATE invite_attribution SET is_present = 0 WHERE guild_id = ? AND member_id = ? AND is_present = 1')
+      .run(member.guild.id, member.id);
+  })();
+}
+
+async function handleInvites(interaction) {
+  const user = interaction.options.getUser('user', true);
+  const member = await interaction.guild.members.fetch(user.id).catch(() => null);
+  const displayName = member?.displayName || user.globalName || user.username;
+  const stats = db.prepare('SELECT invited_count, left_count FROM invite_stats WHERE guild_id = ? AND inviter_id = ?')
+    .get(interaction.guildId, user.id) ?? { invited_count: 0, left_count: 0 };
+  const invited = stats.invited_count;
+  const leaved = stats.left_count;
+  const current = Math.max(0, invited - leaved);
+  const embed = new EmbedBuilder().setColor(0x5865F2).setTitle(`${displayName}'s Invites`)
+    .setThumbnail(user.displayAvatarURL())
+    .addFields(
+      { name: 'Leaved', value: String(leaved), inline: true },
+      { name: 'Invites', value: String(invited), inline: true },
+      { name: 'Current Total Invites', value: String(current), inline: true },
+    )
+    .setFooter({ text: 'Tracking starts with the bot; older invite history cannot be reconstructed.' });
+  await interaction.reply({ embeds: [embed] });
+}
+
 function ordinal(number) {
   const mod100 = number % 100;
   if (mod100 >= 11 && mod100 <= 13) return `${number}th`;
@@ -216,13 +276,12 @@ async function findJoiningInvite(member) {
   }
 }
 
-async function sendWelcome(member) {
+async function sendWelcome(member, inviter) {
   const row = db.prepare('SELECT channel_id, config_json FROM welcome_settings WHERE guild_id = ?').get(member.guild.id);
   if (!row) return;
   const channel = member.guild.channels.cache.get(row.channel_id) ?? await member.guild.channels.fetch(row.channel_id).catch(() => null);
   if (!channel?.isTextBased()) return;
   const config = JSON.parse(row.config_json);
-  const inviter = await findJoiningInvite(member);
   const memberName = member.displayName || member.user.username;
   const inviterName = inviter ? (inviter.globalName || inviter.username) : null;
   const description = `Welcome To Our Server @${memberName}\nYou're Our ${ordinal(member.guild.memberCount)} Member On Our Server\nInvited by ${inviterName ? `@${inviterName}` : 'Unknown (invite could not be identified)'}`;
@@ -407,7 +466,26 @@ client.once('ready', async () => {
   setInterval(unbanExpired, 60_000).unref();
 });
 client.on('guildCreate', guild => snapshotInvites(guild));
-client.on('guildMemberAdd', member => sendWelcome(member).catch(error => console.error('Welcome message failed:', error)));
+async function processMemberJoin(member) {
+  const guildId = member.guild.id;
+  const previous = inviteJoinQueues.get(guildId) ?? Promise.resolve();
+  const current = previous.catch(() => {}).then(async () => {
+    const inviter = await findJoiningInvite(member);
+    recordInviteJoin(member, inviter?.id ?? null);
+    await sendWelcome(member, inviter);
+  });
+  inviteJoinQueues.set(guildId, current);
+  try {
+    await current;
+  } finally {
+    if (inviteJoinQueues.get(guildId) === current) inviteJoinQueues.delete(guildId);
+  }
+}
+client.on('guildMemberAdd', member => processMemberJoin(member).catch(error => console.error('Member join processing failed:', error)));
+client.on('guildMemberRemove', member => {
+  try { recordInviteLeave(member); }
+  catch (error) { console.error('Invite departure tracking failed:', error); }
+});
 client.on('interactionCreate', async interaction => {
   try {
     if (interaction.isChatInputCommand()) {
@@ -416,6 +494,7 @@ client.on('interactionCreate', async interaction => {
       if (interaction.commandName === 'ban') return await handleBan(interaction);
       if (interaction.commandName === 'ticket') return await handleTicketPanel(interaction);
       if (interaction.commandName === 'welcomer') return await handleWelcomer(interaction);
+      if (interaction.commandName === 'invites') return await handleInvites(interaction);
     }
     if (interaction.isButton()) await handleTicketButton(interaction);
   } catch (error) {
