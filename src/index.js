@@ -32,6 +32,9 @@ db.exec(`
     guild_id TEXT NOT NULL, user_id TEXT NOT NULL, expires_at INTEGER NOT NULL,
     PRIMARY KEY (guild_id, user_id)
   );
+  CREATE TABLE IF NOT EXISTS welcome_settings (
+    guild_id TEXT PRIMARY KEY, channel_id TEXT NOT NULL, config_json TEXT NOT NULL
+  );
 `);
 
 const durations = [
@@ -73,9 +76,22 @@ const commands = [
     .addStringOption(o => o.setName('message').setDescription('Message above the open-ticket button').setMaxLength(2000).setRequired(true))
     .addBooleanOption(o => o.setName('embed').setDescription('Show the panel message in an embed').setRequired(false))
     .addRoleOption(o => o.setName('mention_role').setDescription('Support role to mention and allow into tickets').setRequired(false)),
+  new SlashCommandBuilder().setName('welcomer').setDescription('Configure automatic welcome messages for new members.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addChannelOption(o => o.setName('channel').setDescription('Channel to post welcome messages in').addChannelTypes(ChannelType.GuildText).setRequired(true))
+    .addStringOption(o => o.setName('embed_color').setDescription('Six-digit hex color, e.g. #5865F2').setMaxLength(7).setRequired(true))
+    .addAttachmentOption(o => o.setName('big_thumbnail').setDescription('Large image shown on welcome messages').setRequired(false))
+    .addAttachmentOption(o => o.setName('small_thumbnail').setDescription('Small right-side thumbnail').setRequired(false))
+    .addStringOption(o => o.setName('footer').setDescription('Optional embed footer text').setMaxLength(2048).setRequired(false))
+    .addAttachmentOption(o => o.setName('footer_thumbnail').setDescription('Small icon beside the footer').setRequired(false))
+    .addStringOption(o => o.setName('dashboard_link').setDescription('Optional dashboard URL').setMaxLength(512).setRequired(false))
+    .addStringOption(o => o.setName('rules_link').setDescription('Optional server rules URL').setMaxLength(512).setRequired(false))
+    .addStringOption(o => o.setName('tutorial_link').setDescription('Optional getting-started tutorial URL').setMaxLength(512).setRequired(false))
+    .addStringOption(o => o.setName('methods_link').setDescription('Optional methods URL').setMaxLength(512).setRequired(false)),
 ].map(c => c.toJSON());
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
+const inviteSnapshots = new Map();
 const isAdmin = member => Boolean(member?.permissions?.has(PermissionFlagsBits.Administrator));
 const canManageGuild = member => Boolean(member?.permissions?.has(PermissionFlagsBits.ManageGuild) || isAdmin(member));
 const hasPermission = (member, permission) => Boolean(member?.permissions?.has(permission) || isAdmin(member));
@@ -127,6 +143,115 @@ async function handleEmbed(interaction) {
   }
   await interaction.channel.send({ embeds: [embed], ...(linkButton ? { components: [new ActionRowBuilder().addComponents(linkButton)] } : {}) });
   await interaction.reply({ content: 'Embed sent to this channel.', ephemeral: true });
+}
+
+function parseWebUrl(value, label) {
+  if (!value) return null;
+  try {
+    const url = new URL(value.trim());
+    if (!['http:', 'https:'].includes(url.protocol)) throw new Error('Unsupported protocol');
+    return url.toString();
+  } catch {
+    throw new Error(`${label} must be a valid HTTP or HTTPS URL.`);
+  }
+}
+
+async function handleWelcomer(interaction) {
+  if (!canManageGuild(interaction.member)) return interaction.reply({ content: 'You need Manage Server permission to configure the welcomer.', ephemeral: true });
+  const colorText = interaction.options.getString('embed_color', true).trim().replace(/^#/, '');
+  if (!/^[0-9a-fA-F]{6}$/.test(colorText)) return interaction.reply({ content: 'Embed color must be six-digit hex, such as `#5865F2`.', ephemeral: true });
+  let links;
+  try {
+    links = {
+      dashboard: parseWebUrl(interaction.options.getString('dashboard_link'), 'Dashboard link'),
+      rules: parseWebUrl(interaction.options.getString('rules_link'), 'Rules link'),
+      tutorial: parseWebUrl(interaction.options.getString('tutorial_link'), 'Tutorial link'),
+      methods: parseWebUrl(interaction.options.getString('methods_link'), 'Methods link'),
+    };
+  } catch (error) {
+    return interaction.reply({ content: error.message, ephemeral: true });
+  }
+  const channel = interaction.options.getChannel('channel', true);
+  const config = {
+    color: Number.parseInt(colorText, 16),
+    bigThumbnail: interaction.options.getAttachment('big_thumbnail')?.url ?? null,
+    smallThumbnail: interaction.options.getAttachment('small_thumbnail')?.url ?? null,
+    footer: interaction.options.getString('footer'),
+    footerThumbnail: interaction.options.getAttachment('footer_thumbnail')?.url ?? null,
+    links,
+  };
+  db.prepare(`INSERT INTO welcome_settings(guild_id, channel_id, config_json) VALUES(?, ?, ?)
+    ON CONFLICT(guild_id) DO UPDATE SET channel_id=excluded.channel_id, config_json=excluded.config_json`)
+    .run(interaction.guildId, channel.id, JSON.stringify(config));
+  const selectedLinks = Object.values(links).filter(Boolean).length;
+  await interaction.reply({ content: `Welcomer configured for <#${channel.id}> with ${selectedLinks} optional link button${selectedLinks === 1 ? '' : 's'}. Enable Server Members Intent in the Discord Developer Portal to receive join events.`, ephemeral: true });
+}
+
+function ordinal(number) {
+  const mod100 = number % 100;
+  if (mod100 >= 11 && mod100 <= 13) return `${number}th`;
+  switch (number % 10) {
+    case 1: return `${number}st`;
+    case 2: return `${number}nd`;
+    case 3: return `${number}rd`;
+    default: return `${number}th`;
+  }
+}
+
+async function snapshotInvites(guild) {
+  try {
+    const invites = await guild.invites.fetch();
+    inviteSnapshots.set(guild.id, new Map(invites.map(invite => [invite.code, { uses: invite.uses ?? 0, inviterId: invite.inviter?.id ?? null }])));
+  } catch (error) {
+    inviteSnapshots.delete(guild.id);
+    console.warn(`Could not read invite list for ${guild.name}; welcome messages will say inviter is unknown. Check Manage Server permission.`, error.message);
+  }
+}
+
+async function findJoiningInvite(member) {
+  const previous = inviteSnapshots.get(member.guild.id);
+  if (!previous) {
+    await snapshotInvites(member.guild);
+    return null;
+  }
+  try {
+    const currentInvites = await member.guild.invites.fetch();
+    let joiningInvite = null;
+    const next = new Map();
+    for (const invite of currentInvites.values()) {
+      const uses = invite.uses ?? 0;
+      const oldInvite = previous.get(invite.code);
+      next.set(invite.code, { uses, inviterId: invite.inviter?.id ?? oldInvite?.inviterId ?? null });
+      if (uses > (oldInvite?.uses ?? 0)) joiningInvite = invite;
+    }
+    inviteSnapshots.set(member.guild.id, next);
+    return joiningInvite?.inviter ?? (joiningInvite?.inviterId ? await client.users.fetch(joiningInvite.inviterId).catch(() => null) : null);
+  } catch (error) {
+    console.warn(`Could not identify the invite used in ${member.guild.name}; inviter will be unknown.`, error.message);
+    return null;
+  }
+}
+
+async function sendWelcome(member) {
+  const row = db.prepare('SELECT channel_id, config_json FROM welcome_settings WHERE guild_id = ?').get(member.guild.id);
+  if (!row) return;
+  const channel = member.guild.channels.cache.get(row.channel_id) ?? await member.guild.channels.fetch(row.channel_id).catch(() => null);
+  if (!channel?.isTextBased()) return;
+  const config = JSON.parse(row.config_json);
+  const inviter = await findJoiningInvite(member);
+  const content = `Welcome To Our Server ${member}\nYou're Our ${ordinal(member.guild.memberCount)} Member On Our Server\nInvited by ${inviter ? `<@${inviter.id}>` : 'Unknown (invite could not be identified)'}`;
+  const embed = new EmbedBuilder().setColor(config.color).setTitle('Welcome to our server!');
+  if (config.bigThumbnail) embed.setImage(config.bigThumbnail);
+  if (config.smallThumbnail) embed.setThumbnail(config.smallThumbnail);
+  if (config.footer || config.footerThumbnail) embed.setFooter({ text: config.footer || '\u200b', ...(config.footerThumbnail ? { iconURL: config.footerThumbnail } : {}) });
+  const linkDefinitions = [
+    ['Please Read Our Rules', config.links.rules],
+    ['Here’s Our Dashboard', config.links.dashboard],
+    ['Join Tutorial If You’re New', config.links.tutorial],
+    ['OP Leaked Methods Join Now', config.links.methods],
+  ];
+  const buttons = linkDefinitions.filter(([, url]) => url).map(([label, url]) => new ButtonBuilder().setLabel(label).setStyle(ButtonStyle.Link).setURL(url));
+  await channel.send({ content, embeds: [embed], ...(buttons.length ? { components: [new ActionRowBuilder().addComponents(buttons)] } : {}), allowedMentions: { parse: [], users: [member.id, ...(inviter ? [inviter.id] : [])] } });
 }
 
 async function handleAutoMod(interaction) {
@@ -293,9 +418,12 @@ client.once('ready', async () => {
   console.log(`Online as ${client.user.tag}`);
   try { await registerCommands(); }
   catch (error) { console.error('Slash command registration failed:', error); process.exit(1); }
+  await Promise.all([...client.guilds.cache.values()].map(snapshotInvites));
   await unbanExpired();
   setInterval(unbanExpired, 60_000).unref();
 });
+client.on('guildCreate', guild => snapshotInvites(guild));
+client.on('guildMemberAdd', member => sendWelcome(member).catch(error => console.error('Welcome message failed:', error)));
 client.on('interactionCreate', async interaction => {
   try {
     if (interaction.isChatInputCommand()) {
@@ -303,6 +431,7 @@ client.on('interactionCreate', async interaction => {
       if (interaction.commandName === 'automod') return await handleAutoMod(interaction);
       if (interaction.commandName === 'ban') return await handleBan(interaction);
       if (interaction.commandName === 'ticket') return await handleTicketPanel(interaction);
+      if (interaction.commandName === 'welcomer') return await handleWelcomer(interaction);
     }
     if (interaction.isButton()) await handleTicketButton(interaction);
   } catch (error) {
