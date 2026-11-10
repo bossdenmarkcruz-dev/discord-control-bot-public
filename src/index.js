@@ -45,6 +45,11 @@ db.exec(`
     is_present INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (guild_id, member_id)
   );
+  CREATE TABLE IF NOT EXISTS channel_lockdowns (
+    guild_id TEXT NOT NULL, channel_id TEXT NOT NULL,
+    allow_bits TEXT NOT NULL, deny_bits TEXT NOT NULL,
+    PRIMARY KEY (guild_id, channel_id)
+  );
 `);
 
 const durations = [
@@ -100,11 +105,30 @@ const commands = [
     .addChannelOption(o => o.setName('methods_channel').setDescription('Optional Discord channel for methods').addChannelTypes(ChannelType.GuildText).setRequired(false)),
   new SlashCommandBuilder().setName('invites').setDescription('Show the tracked invites for a server member.')
     .addUserOption(o => o.setName('user').setDescription('Member whose invite totals you want to check').setRequired(true)),
+  new SlashCommandBuilder().setName('disable').setDescription('Emergency-lock public text channels against member messages.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+  new SlashCommandBuilder().setName('enable').setDescription('Restore text-channel send permissions saved by /disable.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+  new SlashCommandBuilder().setName('droles').setDescription('Remove Administrator roles from all other members.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addStringOption(o => o.setName('confirmation').setDescription('Type REMOVE ADMIN ROLES to confirm').setMaxLength(40).setRequired(true)),
+  new SlashCommandBuilder().setName('purgeall').setDescription('Permanently delete messages in all accessible text channels.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addStringOption(o => o.setName('confirmation').setDescription('Type PURGE ALL MESSAGES to confirm').setMaxLength(40).setRequired(true)),
 ].map(c => c.toJSON());
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
 const inviteSnapshots = new Map();
 const inviteJoinQueues = new Map();
+const lockdownPermissions = [
+  ['SendMessages', PermissionFlagsBits.SendMessages],
+  ['SendMessagesInThreads', PermissionFlagsBits.SendMessagesInThreads],
+  ['CreatePublicThreads', PermissionFlagsBits.CreatePublicThreads],
+  ['CreatePrivateThreads', PermissionFlagsBits.CreatePrivateThreads],
+];
+const lockdownChannelTypes = new Set([
+  ChannelType.GuildText, ChannelType.GuildAnnouncement, ChannelType.GuildForum, ChannelType.GuildMedia,
+].filter(type => type !== undefined));
 const isAdmin = member => Boolean(member?.permissions?.has(PermissionFlagsBits.Administrator));
 const canManageGuild = member => Boolean(member?.permissions?.has(PermissionFlagsBits.ManageGuild) || isAdmin(member));
 const hasPermission = (member, permission) => Boolean(member?.permissions?.has(permission) || isAdmin(member));
@@ -229,6 +253,234 @@ async function handleInvites(interaction) {
     )
     .setFooter({ text: 'Tracking starts with the bot; older invite history cannot be reconstructed.' });
   await interaction.reply({ embeds: [embed] });
+}
+
+function hasAdminAccess(interaction) {
+  return interaction.user?.id === interaction.guild?.ownerId || isAdmin(interaction.member);
+}
+
+function captureEveryoneBits(channel) {
+  const overwrite = channel.permissionOverwrites.cache.get(channel.guild.id);
+  let allow = 0n;
+  let deny = 0n;
+  for (const [, flag] of lockdownPermissions) {
+    if (overwrite?.allow.has(flag)) allow |= flag;
+    if (overwrite?.deny.has(flag)) deny |= flag;
+  }
+  return { allowBits: allow.toString(), denyBits: deny.toString() };
+}
+
+function restoreEveryoneOptions(allowBits, denyBits) {
+  const allow = BigInt(allowBits);
+  const deny = BigInt(denyBits);
+  return Object.fromEntries(lockdownPermissions.map(([name, flag]) => [
+    name,
+    (allow & flag) !== 0n ? true : (deny & flag) !== 0n ? false : null,
+  ]));
+}
+
+async function handleDisable(interaction) {
+  if (!hasAdminAccess(interaction)) return interaction.reply({ content: 'Only server administrators can use /disable.', ephemeral: true });
+  await interaction.deferReply({ ephemeral: true });
+  const channels = [...interaction.guild.channels.cache.values()].filter(channel => lockdownChannelTypes.has(channel.type));
+  const saveSnapshot = db.prepare('INSERT OR IGNORE INTO channel_lockdowns(guild_id, channel_id, allow_bits, deny_bits) VALUES(?, ?, ?, ?)');
+  const getSnapshot = db.prepare('SELECT 1 FROM channel_lockdowns WHERE guild_id = ? AND channel_id = ?');
+  let locked = 0;
+  let failed = 0;
+  for (const channel of channels) {
+    if (!getSnapshot.get(interaction.guildId, channel.id)) {
+      const { allowBits, denyBits } = captureEveryoneBits(channel);
+      saveSnapshot.run(interaction.guildId, channel.id, allowBits, denyBits);
+    }
+    try {
+      await channel.permissionOverwrites.edit(interaction.guildId, {
+        SendMessages: false,
+        SendMessagesInThreads: false,
+        CreatePublicThreads: false,
+        CreatePrivateThreads: false,
+      }, `Emergency anti-raid lockdown by ${interaction.user.tag}`);
+      locked += 1;
+    } catch (error) {
+      failed += 1;
+      console.error(`Could not lock channel ${channel.id}:`, error.message);
+    }
+  }
+  await interaction.editReply(`Lockdown applied to ${locked} text channels${failed ? `; ${failed} failed` : ''}. Run /enable to restore saved @everyone send permissions. Server administrators still bypass channel locks; roles explicitly allowed to send may also retain access.`);
+}
+
+async function handleEnable(interaction) {
+  if (!hasAdminAccess(interaction)) return interaction.reply({ content: 'Only server administrators can use /enable.', ephemeral: true });
+  await interaction.deferReply({ ephemeral: true });
+  const snapshots = db.prepare('SELECT * FROM channel_lockdowns WHERE guild_id = ?').all(interaction.guildId);
+  if (!snapshots.length) return interaction.editReply('No saved /disable lockdown was found for this server.');
+  const deleteSnapshot = db.prepare('DELETE FROM channel_lockdowns WHERE guild_id = ? AND channel_id = ?');
+  let restored = 0;
+  let failed = 0;
+  for (const snapshot of snapshots) {
+    const channel = interaction.guild.channels.cache.get(snapshot.channel_id)
+      ?? await interaction.guild.channels.fetch(snapshot.channel_id).catch(() => null);
+    if (!channel) {
+      deleteSnapshot.run(interaction.guildId, snapshot.channel_id);
+      continue;
+    }
+    try {
+      await channel.permissionOverwrites.edit(interaction.guildId,
+        restoreEveryoneOptions(snapshot.allow_bits, snapshot.deny_bits),
+        `Restore anti-raid lockdown by ${interaction.user.tag}`);
+      deleteSnapshot.run(interaction.guildId, snapshot.channel_id);
+      restored += 1;
+    } catch (error) {
+      failed += 1;
+      console.error(`Could not restore channel ${snapshot.channel_id}:`, error.message);
+    }
+  }
+  await interaction.editReply(`Restored saved send permissions in ${restored} channels${failed ? `; ${failed} failed and can be retried` : ''}.`);
+}
+
+async function handleDRoles(interaction) {
+  if (!hasAdminAccess(interaction)) return interaction.reply({ content: 'Only server administrators can use /droles.', ephemeral: true });
+  if (interaction.options.getString('confirmation', true) !== 'REMOVE ADMIN ROLES') {
+    return interaction.reply({ content: 'Confirmation did not match. To proceed, type exactly `REMOVE ADMIN ROLES`.', ephemeral: true });
+  }
+  await interaction.deferReply({ ephemeral: true });
+  const adminRoleIds = new Set([...interaction.guild.roles.cache.values()]
+    .filter(role => role.id !== interaction.guildId && !role.managed && role.permissions.has(PermissionFlagsBits.Administrator))
+    .map(role => role.id));
+  if (!adminRoleIds.size) return interaction.editReply('No removable Administrator roles were found.');
+  let changedMembers = 0;
+  let failedMembers = 0;
+  let skippedMembers = 0;
+  let after;
+  try {
+    while (true) {
+      const page = await interaction.guild.members.list({ limit: 1000, ...(after ? { after } : {}) });
+      if (!page.size) break;
+      for (const member of page.values()) {
+        if (member.id === interaction.user.id || member.id === interaction.guild.ownerId || member.id === client.user.id) {
+          skippedMembers += 1;
+          continue;
+        }
+        const rolesToRemove = member.roles.cache.filter(role => adminRoleIds.has(role.id));
+        if (!rolesToRemove.size) continue;
+        try {
+          await member.roles.remove([...rolesToRemove.keys()], `Emergency removal of admin roles by ${interaction.user.tag}`);
+          changedMembers += 1;
+        } catch (error) {
+          failedMembers += 1;
+          console.error(`Could not remove admin roles from ${member.id}:`, error.message);
+        }
+      }
+      const last = page.last();
+      if (page.size < 1000 || !last) break;
+      after = last.id;
+    }
+  } catch (error) {
+    console.error('Could not list all server members for /droles:', error);
+    return interaction.editReply(`Role removal stopped while listing members. ${changedMembers} members were updated; check the Server Members intent and bot logs, then retry if needed.`);
+  }
+  await interaction.editReply(`Removed Administrator roles from ${changedMembers} members. Skipped ${skippedMembers} protected account(s) (command user, server owner, and bot). ${failedMembers} members could not be changed; check Manage Roles and move the bot role above those roles.`);
+}
+
+async function collectPurgeTargets(guild) {
+  const targets = new Map();
+  let unavailableScopes = 0;
+  const add = channel => {
+    if (channel?.isTextBased?.() && typeof channel.messages?.fetch === 'function') targets.set(channel.id, channel);
+  };
+  const parents = [...guild.channels.cache.values()].filter(channel => lockdownChannelTypes.has(channel.type));
+  for (const channel of parents) add(channel);
+  try {
+    const active = await guild.channels.fetchActiveThreads();
+    for (const thread of active.threads.values()) add(thread);
+  } catch (error) {
+    unavailableScopes += 1;
+    console.error('Could not list active threads for /purgeall:', error.message);
+  }
+  for (const parent of parents) {
+    if (!parent.threads?.fetchArchived) continue;
+    for (const type of ['public', 'private']) {
+      let before;
+      let fallbackPrivate = false;
+      while (true) {
+        let archived;
+        try {
+          archived = await parent.threads.fetchArchived({ type, fetchAll: !fallbackPrivate, limit: 100, ...(before ? { before } : {}) });
+        } catch (error) {
+          if (type === 'private' && !fallbackPrivate) {
+            fallbackPrivate = true;
+            before = undefined;
+            continue;
+          }
+          unavailableScopes += 1;
+          console.error(`Could not list ${type} archived threads for ${parent.id}:`, error.message);
+          break;
+        }
+        for (const thread of archived.threads.values()) add(thread);
+        if (!archived.hasMore || !archived.threads.size) break;
+        const oldest = archived.threads.last();
+        before = type === 'private' && fallbackPrivate ? oldest.id : oldest.archivedAt;
+        if (!before) break;
+      }
+    }
+  }
+  return { targets: [...targets.values()], unavailableScopes };
+}
+
+async function purgeMessageHistory(channel, totals) {
+  const bulkDeleteCutoff = 14 * 24 * 60 * 60 * 1000 - 60_000;
+  let before;
+  while (true) {
+    const batch = await channel.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
+    if (!batch.size) break;
+    const oldest = batch.last();
+    if (!oldest) break;
+    before = oldest.id;
+    const recent = batch.filter(message => Date.now() - message.createdTimestamp < bulkDeleteCutoff);
+    const old = batch.filter(message => Date.now() - message.createdTimestamp >= bulkDeleteCutoff);
+    if (recent.size) {
+      try {
+        const deleted = await channel.bulkDelete(recent, true);
+        totals.deleted += deleted.size;
+      } catch (error) {
+        if (error.code === 50013) throw error;
+        for (const message of recent.values()) {
+          try { await message.delete(); totals.deleted += 1; }
+          catch (deleteError) {
+            if (deleteError.code === 50013) throw deleteError;
+            totals.skipped += 1;
+          }
+        }
+      }
+    }
+    for (const message of old.values()) {
+      try { await message.delete(); totals.deleted += 1; }
+      catch (error) {
+        if (error.code === 50013) throw error;
+        totals.skipped += 1;
+      }
+    }
+  }
+}
+
+async function handlePurgeAll(interaction) {
+  if (!hasAdminAccess(interaction)) return interaction.reply({ content: 'Only server administrators can use /purgeall.', ephemeral: true });
+  if (interaction.options.getString('confirmation', true) !== 'PURGE ALL MESSAGES') {
+    return interaction.reply({ content: 'Confirmation did not match. To proceed, type exactly `PURGE ALL MESSAGES`.', ephemeral: true });
+  }
+  await interaction.deferReply({ ephemeral: true });
+  const { targets, unavailableScopes } = await collectPurgeTargets(interaction.guild);
+  const totals = { deleted: 0, skipped: 0, failedChannels: 0 };
+  for (let i = 0; i < targets.length; i += 1) {
+    try { await purgeMessageHistory(targets[i], totals); }
+    catch (error) {
+      totals.failedChannels += 1;
+      console.error(`Could not purge channel ${targets[i].id}:`, error.message);
+    }
+    if ((i + 1) % 10 === 0) {
+      await interaction.editReply(`Purge in progress: ${i + 1}/${targets.length} accessible text channels/threads checked; ${totals.deleted} messages deleted.`).catch(() => {});
+    }
+  }
+  await interaction.editReply(`Purge finished: ${totals.deleted} messages deleted across ${targets.length} accessible text channels/threads. ${totals.skipped} messages were skipped; ${totals.failedChannels} channels failed; ${unavailableScopes} thread scopes could not be listed. This cannot be undone. Private archived threads may require the bot's Manage Threads permission.`);
 }
 
 function ordinal(number) {
@@ -495,6 +747,10 @@ client.on('interactionCreate', async interaction => {
       if (interaction.commandName === 'ticket') return await handleTicketPanel(interaction);
       if (interaction.commandName === 'welcomer') return await handleWelcomer(interaction);
       if (interaction.commandName === 'invites') return await handleInvites(interaction);
+      if (interaction.commandName === 'disable') return await handleDisable(interaction);
+      if (interaction.commandName === 'enable') return await handleEnable(interaction);
+      if (interaction.commandName === 'droles') return await handleDRoles(interaction);
+      if (interaction.commandName === 'purgeall') return await handlePurgeAll(interaction);
     }
     if (interaction.isButton()) await handleTicketButton(interaction);
   } catch (error) {
