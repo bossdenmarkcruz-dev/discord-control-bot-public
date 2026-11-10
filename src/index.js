@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { randomUUID } from 'node:crypto';
 import {
   ActionRowBuilder, AttachmentBuilder, ButtonBuilder, ButtonStyle, ChannelType, Client, EmbedBuilder,
   GatewayIntentBits, PermissionFlagsBits, REST, Routes, SlashCommandBuilder,
@@ -135,11 +136,17 @@ const commands = [
   new SlashCommandBuilder().setName('purgeall').setDescription('Permanently delete messages in all accessible text channels.')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addStringOption(o => o.setName('confirmation').setDescription('Type PURGE ALL MESSAGES to confirm').setMaxLength(40).setRequired(true)),
+  new SlashCommandBuilder().setName('cleanup').setDescription('Preview members currently banned from another server, then optionally kick them.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addStringOption(o => o.setName('serverlink').setDescription('Invite link to the reference server; bot must be in it').setMaxLength(200).setRequired(true))
+    .addStringOption(o => o.setName('rejoin_link').setDescription('Optional invite back to this server; otherwise one-use links are created').setMaxLength(200).setRequired(false))
+    .addIntegerOption(o => o.setName('limit').setDescription('Maximum matches to process after confirmation (default 50; max 100)').setMinValue(1).setMaxValue(100).setRequired(false)),
 ].map(c => c.toJSON());
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
 const inviteSnapshots = new Map();
 const inviteJoinQueues = new Map();
+const cleanupPreviews = new Map();
 const lockdownPermissions = [
   ['SendMessages', PermissionFlagsBits.SendMessages],
   ['SendMessagesInThreads', PermissionFlagsBits.SendMessagesInThreads],
@@ -519,6 +526,223 @@ async function handlePurgeAll(interaction) {
   await interaction.editReply(`Purge finished: ${totals.deleted} messages deleted across ${targets.length} accessible text channels/threads. ${totals.skipped} messages were skipped; ${totals.failedChannels} channels failed; ${unavailableScopes} thread scopes could not be listed. This cannot be undone. Private archived threads may require the bot's Manage Threads permission.`);
 }
 
+function cleanupInviteCode(value) {
+  const match = value.trim().match(/^(?:https?:\/\/)?(?:www\.)?(?:discord\.gg\/|discord(?:app)?\.com\/invite\/)([A-Za-z0-9_-]+)\/?(?:[?#].*)?$/i);
+  return match?.[1] ?? null;
+}
+
+async function fetchAllGuildBans(guild) {
+  const userIds = new Set();
+  let after;
+  while (true) {
+    const page = await guild.bans.fetch({ limit: 1000, cache: false, ...(after ? { after } : {}) });
+    if (!page.size) break;
+    for (const ban of page.values()) userIds.add(ban.user.id);
+    const lastId = page.last()?.user.id;
+    if (page.size < 1000 || !lastId || lastId === after) break;
+    after = lastId;
+  }
+  return userIds;
+}
+
+async function collectCleanupMatches(guild, bannedIds, limit) {
+  const memberIds = [];
+  const sampleNames = [];
+  let totalMatches = 0;
+  let after;
+  while (true) {
+    const page = await guild.members.list({ limit: 1000, cache: false, ...(after ? { after } : {}) });
+    if (!page.size) break;
+    for (const member of page.values()) {
+      if (!bannedIds.has(member.id) || member.user.bot || member.id === guild.ownerId
+        || member.id === client.user.id || member.permissions.has(PermissionFlagsBits.Administrator) || !member.kickable) continue;
+      totalMatches += 1;
+      if (memberIds.length < limit) memberIds.push(member.id);
+      if (sampleNames.length < 10) sampleNames.push(member.displayName || member.user.username);
+    }
+    const lastId = page.last()?.id;
+    if (page.size < 1000 || !lastId || lastId === after) break;
+    after = lastId;
+  }
+  return { memberIds, sampleNames, totalMatches };
+}
+
+async function getCleanupInviteChannel(guild, botMember) {
+  const channels = [guild.systemChannel, ...guild.channels.cache.values()];
+  return channels.find(channel => channel
+    && [ChannelType.GuildText, ChannelType.GuildAnnouncement].includes(channel.type)
+    && channel.permissionsFor(botMember)?.has(PermissionFlagsBits.CreateInstantInvite)) ?? null;
+}
+
+async function handleCleanup(interaction) {
+  if (!hasAdminAccess(interaction)) return interaction.reply({ content: 'Only server administrators can use /cleanup.', ephemeral: true });
+  await interaction.deferReply({ ephemeral: true });
+  const sourceCode = cleanupInviteCode(interaction.options.getString('serverlink', true));
+  if (!sourceCode) return interaction.editReply('Enter a Discord invite link such as `https://discord.gg/example` for the reference server.');
+
+  let sourceInvite;
+  try { sourceInvite = await client.fetchInvite(sourceCode); }
+  catch { return interaction.editReply('That reference-server invite is invalid, expired, or inaccessible.'); }
+  const sourceGuildId = sourceInvite.guild?.id;
+  if (!sourceGuildId) return interaction.editReply('The invite must point to a server, not a group DM.');
+  if (sourceGuildId === interaction.guildId) return interaction.editReply('Use a different reference server; this command checks another server’s current ban list.');
+
+  const sourceGuild = client.guilds.cache.get(sourceGuildId) ?? await client.guilds.fetch(sourceGuildId).catch(() => null);
+  if (!sourceGuild) return interaction.editReply('The bot must also be a member of the reference server before it can read that server’s bans.');
+  const sourceBotMember = sourceGuild.members.me ?? await sourceGuild.members.fetchMe().catch(() => null);
+  if (!sourceBotMember?.permissions.has(PermissionFlagsBits.BanMembers)
+    && !sourceBotMember?.permissions.has(PermissionFlagsBits.ViewAuditLog)) {
+    return interaction.editReply('Give the bot **Ban Members** or **View Audit Log** in the reference server so it can read that server’s ban list.');
+  }
+  const targetBotMember = interaction.guild.members.me ?? await interaction.guild.members.fetchMe().catch(() => null);
+  if (!targetBotMember?.permissions.has(PermissionFlagsBits.KickMembers)) {
+    return interaction.editReply('The bot needs **Kick Members** in this server to run /cleanup.');
+  }
+
+  let rejoinUrl = null;
+  let inviteChannelId = null;
+  const customRejoinLink = interaction.options.getString('rejoin_link')?.trim();
+  if (customRejoinLink) {
+    const code = cleanupInviteCode(customRejoinLink);
+    if (!code) return interaction.editReply('`rejoin_link` must be a Discord invite URL for this server.');
+    const invite = await client.fetchInvite(code).catch(() => null);
+    if (invite?.guild?.id !== interaction.guildId) return interaction.editReply('`rejoin_link` must point back to this server.');
+    rejoinUrl = `https://discord.gg/${code}`;
+  } else {
+    const inviteChannel = await getCleanupInviteChannel(interaction.guild, targetBotMember);
+    if (!inviteChannel) return interaction.editReply('To DM rejoin links, give the bot **Create Invite** in a text channel or supply `rejoin_link` for this server.');
+    inviteChannelId = inviteChannel.id;
+  }
+
+  const limit = interaction.options.getInteger('limit') ?? 50;
+  let bannedIds;
+  let matches;
+  try {
+    bannedIds = await fetchAllGuildBans(sourceGuild);
+    matches = await collectCleanupMatches(interaction.guild, bannedIds, limit);
+  } catch (error) {
+    console.error('Could not prepare /cleanup preview:', error);
+    return interaction.editReply('Could not read the reference ban list or this server’s member list. Check bot permissions and the Server Members intent; no members were kicked.');
+  }
+  if (!matches.memberIds.length) {
+    return interaction.editReply(matches.totalMatches
+      ? `Found ${matches.totalMatches} matches, but none can be kicked by the bot because of role hierarchy or protected-account checks.`
+      : `No kickable non-admin members in this server are currently on **${escapeText(sourceGuild.name)}**’s ban list.`);
+  }
+
+  const token = randomUUID();
+  const expiresAt = Date.now() + 120_000;
+  cleanupPreviews.set(token, {
+    requesterId: interaction.user.id,
+    targetGuildId: interaction.guildId,
+    sourceGuildId,
+    memberIds: matches.memberIds,
+    totalMatches: matches.totalMatches,
+    rejoinUrl,
+    inviteChannelId,
+    expiresAt,
+  });
+  const timeout = setTimeout(() => cleanupPreviews.delete(token), 120_000);
+  timeout.unref?.();
+
+  const embed = new EmbedBuilder().setColor(0xED4245).setTitle('Cleanup preview')
+    .setDescription(`Reference server: **${escapeText(sourceGuild.name)}**\nCurrent server: **${escapeText(interaction.guild.name)}**\nFound **${matches.totalMatches}** kickable, non-admin match(es). This confirmation processes up to **${matches.memberIds.length}** member(s).`)
+    .setFooter({ text: 'Checks current server-specific bans only—not Discord-wide account bans or ban duration. Expires in 2 minutes.' });
+  if (matches.sampleNames.length) {
+    const names = matches.sampleNames.map(name => `• ${escapeText(name).replaceAll('@', '@\u200b')}`).join('\n');
+    embed.addFields({ name: `Sample matched members (${Math.min(10, matches.totalMatches)} max)`, value: names });
+  }
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`cleanup:confirm:${token}`).setLabel(`Confirm kick (${matches.memberIds.length})`).setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`cleanup:cancel:${token}`).setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+  );
+  await interaction.editReply({ embeds: [embed], components: [row] });
+}
+
+async function processCleanupPreview(interaction, preview) {
+  const targetGuild = client.guilds.cache.get(preview.targetGuildId);
+  const sourceGuild = client.guilds.cache.get(preview.sourceGuildId);
+  if (!targetGuild || !sourceGuild) return interaction.editReply('A required server is no longer available to the bot; no members were kicked.');
+  const sourceBotMember = sourceGuild.members.me ?? await sourceGuild.members.fetchMe().catch(() => null);
+  if (!sourceBotMember?.permissions.has(PermissionFlagsBits.BanMembers)
+    && !sourceBotMember?.permissions.has(PermissionFlagsBits.ViewAuditLog)) {
+    return interaction.editReply('The bot no longer has permission to read the reference ban list; no members were kicked.');
+  }
+  const targetBotMember = targetGuild.members.me ?? await targetGuild.members.fetchMe().catch(() => null);
+  if (!targetBotMember?.permissions.has(PermissionFlagsBits.KickMembers)) {
+    return interaction.editReply('The bot no longer has Kick Members permission; no members were kicked.');
+  }
+  const bannedIds = await fetchAllGuildBans(sourceGuild);
+  const counts = { kicked: 0, dmFailed: 0, kickFailed: 0, noLongerBanned: 0, skipped: 0, inviteFailed: 0 };
+  for (const userId of preview.memberIds) {
+    if (!bannedIds.has(userId)) { counts.noLongerBanned += 1; continue; }
+    const member = await targetGuild.members.fetch(userId).catch(() => null);
+    if (!member || member.user.bot || member.id === targetGuild.ownerId || member.id === client.user.id
+      || member.permissions.has(PermissionFlagsBits.Administrator) || !member.kickable) {
+      counts.skipped += 1;
+      continue;
+    }
+    let inviteUrl = preview.rejoinUrl;
+    if (!inviteUrl) {
+      const inviteChannel = targetGuild.channels.cache.get(preview.inviteChannelId);
+      if (!inviteChannel || !inviteChannel.permissionsFor(targetBotMember)?.has(PermissionFlagsBits.CreateInstantInvite)) {
+        counts.inviteFailed += 1;
+        continue;
+      }
+      try {
+        const invite = await inviteChannel.createInvite({
+          maxAge: 7 * 24 * 60 * 60,
+          maxUses: 1,
+          unique: true,
+          reason: `One-use rejoin link for cleanup action by ${interaction.user.tag}`,
+        });
+        inviteUrl = invite.url;
+      } catch (error) {
+        counts.inviteFailed += 1;
+        console.error(`Could not create rejoin invite for ${userId}:`, error.message);
+        continue;
+      }
+    }
+    try {
+      await member.kick(`Matched current ban list in reference server ${sourceGuild.name}; cleanup confirmed by ${interaction.user.tag}`);
+      counts.kicked += 1;
+    } catch (error) {
+      counts.kickFailed += 1;
+      console.error(`Could not kick cleanup match ${userId}:`, error.message);
+      continue;
+    }
+    const dm = `Hello — you were kicked from **${targetGuild.name}** because our bot found your account on the current ban list of **${sourceGuild.name}**. If you think this is a mistake, you can rejoin this server using this invite: ${inviteUrl}`;
+    try { await member.send(dm); }
+    catch (error) {
+      counts.dmFailed += 1;
+      console.warn(`Cleanup kick succeeded but DM failed for ${userId}:`, error.message);
+    }
+  }
+  const unprocessed = Math.max(0, preview.totalMatches - preview.memberIds.length);
+  await interaction.editReply(`Cleanup finished. Kicked: **${counts.kicked}**. DM delivery failed: **${counts.dmFailed}**. Kick failed: **${counts.kickFailed}**. Invite creation failed: **${counts.inviteFailed}**. No longer banned: **${counts.noLongerBanned}**. Skipped/protected: **${counts.skipped}**.${unprocessed ? ` ${unprocessed} additional matches were not included because of the per-run limit; run /cleanup again to preview them.` : ''}`);
+}
+
+async function handleCleanupButton(interaction) {
+  const [, action, token] = interaction.customId.split(':');
+  const preview = cleanupPreviews.get(token);
+  if (!preview || preview.expiresAt < Date.now()) {
+    cleanupPreviews.delete(token);
+    return interaction.reply({ content: 'This cleanup preview expired. Run /cleanup again to create a fresh preview.', ephemeral: true });
+  }
+  if (interaction.user.id !== preview.requesterId || !hasAdminAccess(interaction)) {
+    return interaction.reply({ content: 'Only the administrator who created this preview can confirm or cancel it.', ephemeral: true });
+  }
+  cleanupPreviews.delete(token);
+  if (action === 'cancel') return interaction.update({ content: 'Cleanup cancelled; no members were kicked.', embeds: [], components: [] });
+  if (action !== 'confirm') return interaction.reply({ content: 'Unknown cleanup action.', ephemeral: true });
+  await interaction.update({ content: 'Rechecking the source ban list and processing the confirmed cleanup…', embeds: [], components: [] });
+  try { await processCleanupPreview(interaction, preview); }
+  catch (error) {
+    console.error('Confirmed /cleanup failed:', error);
+    await interaction.editReply('Cleanup stopped because of an unexpected error. Check bot logs; some earlier members may already have been kicked.');
+  }
+}
+
 function ordinal(number) {
   const mod100 = number % 100;
   if (mod100 >= 11 && mod100 <= 13) return `${number}th`;
@@ -870,8 +1094,12 @@ client.on('interactionCreate', async interaction => {
       if (interaction.commandName === 'enable') return await handleEnable(interaction);
       if (interaction.commandName === 'droles') return await handleDRoles(interaction);
       if (interaction.commandName === 'purgeall') return await handlePurgeAll(interaction);
+      if (interaction.commandName === 'cleanup') return await handleCleanup(interaction);
     }
-    if (interaction.isButton()) await handleTicketButton(interaction);
+    if (interaction.isButton()) {
+      if (interaction.customId.startsWith('cleanup:')) return await handleCleanupButton(interaction);
+      return await handleTicketButton(interaction);
+    }
   } catch (error) {
     console.error('Interaction failed:', error);
     const response = { content: 'Something went wrong. Check bot logs and permissions.', ephemeral: true };
