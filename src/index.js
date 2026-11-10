@@ -1,9 +1,10 @@
 import 'dotenv/config';
 import {
-  ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, Client, EmbedBuilder,
+  ActionRowBuilder, AttachmentBuilder, ButtonBuilder, ButtonStyle, ChannelType, Client, EmbedBuilder,
   GatewayIntentBits, PermissionFlagsBits, REST, Routes, SlashCommandBuilder,
 } from 'discord.js';
 import Database from 'better-sqlite3';
+import sharp from 'sharp';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -91,18 +92,22 @@ const commands = [
     .addStringOption(o => o.setName('message').setDescription('Message above the open-ticket button').setMaxLength(2000).setRequired(true))
     .addBooleanOption(o => o.setName('embed').setDescription('Show the panel message in an embed').setRequired(false))
     .addRoleOption(o => o.setName('mention_role').setDescription('Support role to mention and allow into tickets').setRequired(false)),
-  new SlashCommandBuilder().setName('welcomer').setDescription('Configure automatic welcome messages for new members.')
+  new SlashCommandBuilder().setName('welcomer').setDescription('Configure the welcome card, channel mentions, and optional link.')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addChannelOption(o => o.setName('channel').setDescription('Channel to post welcome messages in').addChannelTypes(ChannelType.GuildText).setRequired(true))
     .addStringOption(o => o.setName('embed_color').setDescription('Six-digit hex color, e.g. #5865F2').setMaxLength(7).setRequired(true))
-    .addAttachmentOption(o => o.setName('big_thumbnail').setDescription('Large image shown on welcome messages').setRequired(false))
-    .addAttachmentOption(o => o.setName('small_thumbnail').setDescription('Small right-side thumbnail').setRequired(false))
+    .addAttachmentOption(o => o.setName('big_thumbnail').setDescription('Optional background art for the personalized welcome banner').setRequired(false))
+    .addAttachmentOption(o => o.setName('small_thumbnail').setDescription('Optional small circular badge icon; server icon is the default').setRequired(false))
     .addStringOption(o => o.setName('footer').setDescription('Optional embed footer text').setMaxLength(2048).setRequired(false))
     .addAttachmentOption(o => o.setName('footer_thumbnail').setDescription('Small icon beside the footer').setRequired(false))
     .addChannelOption(o => o.setName('dashboard_channel').setDescription('Optional Discord channel for your dashboard').addChannelTypes(ChannelType.GuildText).setRequired(false))
     .addChannelOption(o => o.setName('rules_channel').setDescription('Optional Discord channel for server rules').addChannelTypes(ChannelType.GuildText).setRequired(false))
+    .addChannelOption(o => o.setName('verification_channel').setDescription('Optional Discord channel for verification').addChannelTypes(ChannelType.GuildText).setRequired(false))
+    .addChannelOption(o => o.setName('updates_channel').setDescription('Optional Discord channel for server updates').addChannelTypes(ChannelType.GuildText).setRequired(false))
+    .addChannelOption(o => o.setName('methods_channel').setDescription('Optional Discord channel for methods').addChannelTypes(ChannelType.GuildText).setRequired(false))
     .addChannelOption(o => o.setName('tutorial_channel').setDescription('Optional Discord channel for tutorials').addChannelTypes(ChannelType.GuildText).setRequired(false))
-    .addChannelOption(o => o.setName('methods_channel').setDescription('Optional Discord channel for methods').addChannelTypes(ChannelType.GuildText).setRequired(false)),
+    .addStringOption(o => o.setName('link_url').setDescription('Optional HTTP/HTTPS URL shown as a button below the embed').setMaxLength(512).setRequired(false))
+    .addStringOption(o => o.setName('link_name').setDescription('Optional clickable button name (defaults to Open Link)').setMaxLength(80).setRequired(false)),
   new SlashCommandBuilder().setName('invites').setDescription('Show the tracked invites for a server member.')
     .addUserOption(o => o.setName('user').setDescription('Member whose invite totals you want to check').setRequired(true)),
   new SlashCommandBuilder().setName('disable').setDescription('Emergency-lock public text channels against member messages.')
@@ -186,11 +191,24 @@ async function handleWelcomer(interaction) {
   if (!canManageGuild(interaction.member)) return interaction.reply({ content: 'You need Manage Server permission to configure the welcomer.', ephemeral: true });
   const colorText = interaction.options.getString('embed_color', true).trim().replace(/^#/, '');
   if (!/^[0-9a-fA-F]{6}$/.test(colorText)) return interaction.reply({ content: 'Embed color must be six-digit hex, such as `#5865F2`.', ephemeral: true });
+  const linkUrl = interaction.options.getString('link_url')?.trim() || null;
+  const linkName = interaction.options.getString('link_name')?.trim() || null;
+  if (linkName && !linkUrl) return interaction.reply({ content: 'Set `link_url` too when you provide a `link_name`.', ephemeral: true });
+  if (linkUrl) {
+    try {
+      const parsed = new URL(linkUrl);
+      if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Unsupported protocol');
+    } catch {
+      return interaction.reply({ content: '`link_url` must be a valid HTTP or HTTPS URL.', ephemeral: true });
+    }
+  }
   const links = {
     dashboard: interaction.options.getChannel('dashboard_channel')?.id ?? null,
     rules: interaction.options.getChannel('rules_channel')?.id ?? null,
-    tutorial: interaction.options.getChannel('tutorial_channel')?.id ?? null,
+    verification: interaction.options.getChannel('verification_channel')?.id ?? null,
+    updates: interaction.options.getChannel('updates_channel')?.id ?? null,
     methods: interaction.options.getChannel('methods_channel')?.id ?? null,
+    tutorial: interaction.options.getChannel('tutorial_channel')?.id ?? null,
   };
   const channel = interaction.options.getChannel('channel', true);
   const config = {
@@ -200,12 +218,13 @@ async function handleWelcomer(interaction) {
     footer: interaction.options.getString('footer'),
     footerThumbnail: interaction.options.getAttachment('footer_thumbnail')?.url ?? null,
     links,
+    link: linkUrl ? { url: new URL(linkUrl).toString(), name: linkName || 'Open Link' } : null,
   };
   db.prepare(`INSERT INTO welcome_settings(guild_id, channel_id, config_json) VALUES(?, ?, ?)
     ON CONFLICT(guild_id) DO UPDATE SET channel_id=excluded.channel_id, config_json=excluded.config_json`)
     .run(interaction.guildId, channel.id, JSON.stringify(config));
   const selectedLinks = Object.values(links).filter(Boolean).length;
-  await interaction.reply({ content: `Welcomer configured for <#${channel.id}> with ${selectedLinks} optional channel mention${selectedLinks === 1 ? '' : 's'}. Enable Server Members Intent in the Discord Developer Portal to receive join events.`, ephemeral: true });
+  await interaction.reply({ content: `Welcomer configured for <#${channel.id}> with ${selectedLinks} channel mention${selectedLinks === 1 ? '' : 's'}${config.link ? ` and the **${config.link.name}** button` : ''}. Join cards show the member avatar, join date, inviter, and member number.`, ephemeral: true });
 }
 
 function recordInviteJoin(member, inviterId) {
@@ -528,29 +547,106 @@ async function findJoiningInvite(member) {
   }
 }
 
+function escapeXml(value) {
+  return String(value).replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[character]);
+}
+
+async function fetchImageBuffer(url, maxBytes = 8 * 1024 * 1024) {
+  const response = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+  if (!response.ok) throw new Error(`Image request failed with HTTP ${response.status}`);
+  const contentLength = Number(response.headers.get('content-length') || 0);
+  if (contentLength > maxBytes) throw new Error('Image is larger than the welcome-card limit');
+  const buffer = Buffer.from(await response.arrayBuffer());
+  if (buffer.length > maxBytes) throw new Error('Image is larger than the welcome-card limit');
+  return sharp(buffer).rotate().png().toBuffer();
+}
+
+async function renderWelcomeCard(member, memberCount, config) {
+  const avatarUrl = member.user.displayAvatarURL({ extension: 'png', size: 256 });
+  const serverIconUrl = config.smallThumbnail || member.guild.iconURL({ extension: 'png', size: 96 });
+  const [avatarBuffer, serverIconBuffer, uploadedBackground] = await Promise.all([
+    fetchImageBuffer(avatarUrl).catch(error => { console.warn('Welcome avatar unavailable:', error.message); return null; }),
+    serverIconUrl ? fetchImageBuffer(serverIconUrl, 4 * 1024 * 1024).catch(error => { console.warn('Welcome server icon unavailable:', error.message); return null; }) : null,
+    config.bigThumbnail ? fetchImageBuffer(config.bigThumbnail).catch(error => { console.warn('Welcome background unavailable:', error.message); return null; }) : null,
+  ]);
+  const width = 960;
+  const height = 400;
+  const accent = `#${Number(config.color).toString(16).padStart(6, '0').slice(-6)}`;
+  const baseSvg = Buffer.from(`<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#1b2332"/><stop offset="1" stop-color="#07090f"/></linearGradient><radialGradient id="glow"><stop stop-color="${accent}" stop-opacity=".25"/><stop offset="1" stop-color="${accent}" stop-opacity="0"/></radialGradient></defs><rect width="100%" height="100%" fill="url(#bg)"/><circle cx="840" cy="30" r="360" fill="url(#glow)"/><path d="M0 330 270 0h160L120 400H0z" fill="#fff" opacity=".025"/><path d="M620 400 900 0h60v180L790 400z" fill="${accent}" opacity=".06"/></svg>`);
+  let background = uploadedBackground
+    ? sharp(uploadedBackground).resize(width, height, { fit: 'cover' }).modulate({ brightness: 0.38, saturation: 0.65 }).png()
+    : sharp(baseSvg).png();
+  const avatarNode = avatarBuffer
+    ? `<image href="data:image/png;base64,${avatarBuffer.toString('base64')}" x="82" y="108" width="184" height="184" preserveAspectRatio="xMidYMid slice" clip-path="url(#avatarClip)"/>`
+    : `<text x="174" y="218" fill="#fff" font-size="70" text-anchor="middle" font-family="Arial,sans-serif">?</text>`;
+  const serverIconNode = serverIconBuffer
+    ? `<image href="data:image/png;base64,${serverIconBuffer.toString('base64')}" x="337" y="275" width="30" height="30" preserveAspectRatio="xMidYMid slice" clip-path="url(#serverClip)"/>`
+    : `<circle cx="352" cy="290" r="15" fill="${accent}"/>`;
+  const name = escapeXml(member.displayName || member.user.username);
+  const svg = Buffer.from(`<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg"><defs><clipPath id="avatarClip"><circle cx="174" cy="200" r="92"/></clipPath><clipPath id="serverClip"><circle cx="352" cy="290" r="15"/></clipPath></defs><rect x="6" y="6" width="948" height="388" rx="28" fill="#090b12" fill-opacity=".42" stroke="#fff" stroke-opacity=".82" stroke-width="5"/><circle cx="174" cy="200" r="101" fill="#111722" stroke="${accent}" stroke-width="6"/>${avatarNode}<text x="326" y="146" fill="${accent}" font-family="Arial,sans-serif" font-size="22" font-weight="700" letter-spacing="5">WELCOME</text><rect x="326" y="162" width="175" height="4" rx="2" fill="${accent}"/><text x="326" y="235" fill="#ffffff" font-family="Arial,sans-serif" font-size="54" font-weight="700" textLength="530" lengthAdjust="spacingAndGlyphs">${name}</text>${serverIconNode}<text x="382" y="298" fill="#d8dce5" font-family="Arial,sans-serif" font-size="23" textLength="490" lengthAdjust="spacingAndGlyphs">INJURIES • Member #${memberCount}</text><text x="326" y="344" fill="#9ba4b5" font-family="Arial,sans-serif" font-size="16" letter-spacing="2">WELCOME TO THE COMMUNITY</text></svg>`);
+  return background.composite([{ input: svg, top: 0, left: 0 }]).png().toBuffer();
+}
+
 async function sendWelcome(member, inviter) {
   const row = db.prepare('SELECT channel_id, config_json FROM welcome_settings WHERE guild_id = ?').get(member.guild.id);
   if (!row) return;
   const channel = member.guild.channels.cache.get(row.channel_id) ?? await member.guild.channels.fetch(row.channel_id).catch(() => null);
   if (!channel?.isTextBased()) return;
   const config = JSON.parse(row.config_json);
+  const links = config.links ?? {};
+  const memberCount = member.guild.memberCount;
   const memberName = member.displayName || member.user.username;
   const inviterName = inviter ? (inviter.globalName || inviter.username) : null;
-  const description = `Welcome To Our Server @${memberName}\nYou're Our ${ordinal(member.guild.memberCount)} Member On Our Server\nInvited by ${inviterName ? `@${inviterName}` : 'Unknown (invite could not be identified)'}`;
-  const embed = new EmbedBuilder().setColor(config.color).setTitle('Welcome to our server!').setDescription(description);
-  if (config.bigThumbnail) embed.setImage(config.bigThumbnail);
-  if (config.smallThumbnail) embed.setThumbnail(config.smallThumbnail);
+  const joinedTimestamp = Math.floor((member.joinedAt?.getTime() || Date.now()) / 1000);
+  const description = `Hey @${memberName}! You're member #${memberCount}. Joined on <t:${joinedTimestamp}:D>.\nInvited by ${inviterName ? `@${inviterName}` : 'Unknown (invite could not be identified)'}`;
+  const serverIcon = member.guild.iconURL({ extension: 'png', size: 128 });
+  const memberAvatar = member.user.displayAvatarURL({ extension: 'png', size: 128 });
+  const embed = new EmbedBuilder().setColor(config.color).setTitle('Welcome!').setDescription(description)
+    .setAuthor({ name: `INJURIES • Member #${memberCount}`, ...(serverIcon ? { iconURL: serverIcon } : {}) })
+    .setThumbnail(memberAvatar);
   if (config.footer || config.footerThumbnail) embed.setFooter({ text: config.footer || '\u200b', ...(config.footerThumbnail ? { iconURL: config.footerThumbnail } : {}) });
-  const linkDefinitions = [
-    ['Please Read Our Rules', config.links.rules],
-    ['Here’s Our Dashboard', config.links.dashboard],
-    ['Join Tutorial If You’re New', config.links.tutorial],
-    ['OP Leaked Methods Join Now', config.links.methods],
+  const channelDefinitions = [
+    ['Dashboard', links.dashboard],
+    ['Rules', links.rules],
+    ['Verification', links.verification],
+    ['Updates', links.updates],
+    ['Methods', links.methods],
+    ['Tutorial', links.tutorial],
   ];
-  const linkFields = linkDefinitions.filter(([, channelId]) => typeof channelId === 'string' && /^\d{17,20}$/.test(channelId))
-    .map(([name, channelId]) => ({ name, value: `<#${channelId}>`, inline: false }));
-  if (linkFields.length) embed.addFields(linkFields);
-  await channel.send({ embeds: [embed] });
+  const channelFields = channelDefinitions.filter(([, channelId]) => typeof channelId === 'string' && /^\d{17,20}$/.test(channelId))
+    .map(([name, channelId]) => ({ name, value: `<#${channelId}>`, inline: true }));
+  if (channelFields.length) embed.addFields(channelFields);
+  let files = [];
+  const botMember = member.guild.members.me;
+  const canAttach = botMember && channel.permissionsFor?.(botMember)?.has(PermissionFlagsBits.AttachFiles);
+  if (canAttach === false) {
+    console.warn(`Cannot upload personalized welcome card in ${channel.id}; grant Attach Files permission.`);
+    if (config.bigThumbnail) embed.setImage(config.bigThumbnail);
+  } else {
+    try {
+      const card = await renderWelcomeCard(member, memberCount, config);
+      embed.setImage('attachment://welcome-card.png');
+      files = [new AttachmentBuilder(card, { name: 'welcome-card.png' })];
+    } catch (error) {
+      console.error('Could not render personalized welcome card:', error);
+      if (config.bigThumbnail) embed.setImage(config.bigThumbnail);
+    }
+  }
+  const link = config.link;
+  const components = [];
+  if (link?.url) {
+    try {
+      const parsed = new URL(link.url);
+      if (['http:', 'https:'].includes(parsed.protocol)) {
+        components.push(new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setLabel((link.name || 'Open Link').slice(0, 80)).setStyle(ButtonStyle.Link).setURL(parsed.toString()),
+        ));
+      }
+    } catch (error) {
+      console.warn('Stored welcomer link is invalid; sending without the button.', error.message);
+    }
+  }
+  await channel.send({ embeds: [embed], ...(files.length ? { files } : {}), ...(components.length ? { components } : {}) });
 }
 
 async function handleAutoMod(interaction) {

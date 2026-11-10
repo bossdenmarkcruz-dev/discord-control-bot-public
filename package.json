@@ -3,9 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Discord bot with embeds, automod, timed bans, and private tickets",
+  "description": "Discord bot with welcome cards, moderation, raid controls, and private tickets",
   "engines": {
-    "node": ">=20"
+    "node": ">=20.9.0"
   },
   "scripts": {
     "start": "node src/index.js",
@@ -14,6 +14,7 @@
   "dependencies": {
     "better-sqlite3": "^11.8.1",
     "discord.js": "^14.19.3",
-    "dotenv": "^16.4.7"
+    "dotenv": "^16.4.7",
+    "sharp": "^0.35.5"
   }
 }
