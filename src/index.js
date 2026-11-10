@@ -16,10 +16,25 @@ if (!token || !clientId) {
   process.exit(1);
 }
 
-const dataDir = process.env.DATA_DIR || path.resolve('data');
+const dataDir = process.env.DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH || path.resolve('data');
 fs.mkdirSync(dataDir, { recursive: true });
-const db = new Database(path.join(dataDir, 'bot.sqlite'));
+const databasePath = path.join(dataDir, 'bot.sqlite');
+const restorePath = path.join(dataDir, 'bot.sqlite.restore');
+if (fs.existsSync(restorePath)) {
+  const restoreDb = new Database(restorePath, { readonly: true, fileMustExist: true });
+  const integrity = restoreDb.pragma('integrity_check', { simple: true });
+  restoreDb.close();
+  if (integrity !== 'ok') throw new Error(`SQLite restore snapshot failed integrity check: ${integrity}`);
+  if (fs.existsSync(databasePath)) fs.renameSync(databasePath, `${databasePath}.pre-restore-${Date.now()}`);
+  fs.rmSync(`${databasePath}-wal`, { force: true });
+  fs.rmSync(`${databasePath}-shm`, { force: true });
+  fs.renameSync(restorePath, databasePath);
+  console.log('Restored SQLite data from the one-time migration snapshot.');
+}
+console.log(`SQLite data directory: ${dataDir}`);
+const db = new Database(databasePath);
 db.pragma('journal_mode = WAL');
+db.pragma('synchronous = FULL');
 db.exec(`
   CREATE TABLE IF NOT EXISTS automod (
     guild_id TEXT PRIMARY KEY, channel_id TEXT NOT NULL, punishment TEXT NOT NULL,
@@ -229,6 +244,8 @@ async function handleWelcomer(interaction) {
 
 function recordInviteJoin(member, inviterId) {
   db.transaction(() => {
+    const existing = db.prepare('SELECT is_present FROM invite_attribution WHERE guild_id = ? AND member_id = ?').get(member.guild.id, member.id);
+    if (existing?.is_present) return;
     if (inviterId) {
       db.prepare(`INSERT INTO invite_stats(guild_id, inviter_id, invited_count, left_count) VALUES(?, ?, 1, 0)
         ON CONFLICT(guild_id, inviter_id) DO UPDATE SET invited_count=invite_stats.invited_count + 1`)
@@ -270,7 +287,7 @@ async function handleInvites(interaction) {
       { name: 'Invites', value: String(invited), inline: true },
       { name: 'Current Total Invites', value: String(current), inline: true },
     )
-    .setFooter({ text: 'Tracking starts with the bot; older invite history cannot be reconstructed.' });
+    .setFooter({ text: 'Only unambiguous invite joins and recorded departures are counted; past or offline gaps may be unavailable.' });
   await interaction.reply({ embeds: [embed] });
 }
 
@@ -531,16 +548,22 @@ async function findJoiningInvite(member) {
   }
   try {
     const currentInvites = await member.guild.invites.fetch();
-    let joiningInvite = null;
+    const increasedInvites = [];
     const next = new Map();
     for (const invite of currentInvites.values()) {
       const uses = invite.uses ?? 0;
       const oldInvite = previous.get(invite.code);
       next.set(invite.code, { uses, inviterId: invite.inviter?.id ?? oldInvite?.inviterId ?? null });
-      if (uses > (oldInvite?.uses ?? 0)) joiningInvite = invite;
+      const increase = uses - (oldInvite?.uses ?? 0);
+      if (increase > 0) increasedInvites.push({ invite, increase, inviterId: invite.inviter?.id ?? oldInvite?.inviterId ?? null });
     }
     inviteSnapshots.set(member.guild.id, next);
-    return joiningInvite?.inviter ?? (joiningInvite?.inviterId ? await client.users.fetch(joiningInvite.inviterId).catch(() => null) : null);
+    if (increasedInvites.length !== 1 || increasedInvites[0].increase !== 1) {
+      if (increasedInvites.length) console.warn(`Ambiguous invite-use changes in ${member.guild.name}; this member will not be credited to a guessed inviter.`);
+      return null;
+    }
+    const joiningInvite = increasedInvites[0];
+    return joiningInvite.invite.inviter ?? (joiningInvite.inviterId ? await client.users.fetch(joiningInvite.inviterId).catch(() => null) : null);
   } catch (error) {
     console.warn(`Could not identify the invite used in ${member.guild.name}; inviter will be unknown.`, error.message);
     return null;
@@ -858,5 +881,11 @@ client.on('interactionCreate', async interaction => {
 });
 client.on('messageCreate', message => moderateMessage(message).catch(error => console.error('AutoMod handler error:', error)));
 client.on('error', error => console.error('Discord client error:', error));
-process.on('SIGTERM', () => { db.close(); client.destroy(); process.exit(0); });
+process.on('SIGTERM', () => {
+  try { db.pragma('wal_checkpoint(TRUNCATE)'); }
+  catch (error) { console.error('SQLite shutdown checkpoint failed:', error); }
+  db.close();
+  client.destroy();
+  process.exit(0);
+});
 client.login(token);
