@@ -136,6 +136,9 @@ const commands = [
   new SlashCommandBuilder().setName('purgeall').setDescription('Permanently delete messages in all accessible text channels.')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addStringOption(o => o.setName('confirmation').setDescription('Type PURGE ALL MESSAGES to confirm').setMaxLength(40).setRequired(true)),
+  new SlashCommandBuilder().setName('purge').setDescription('Permanently delete all messages in the channel where used.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addStringOption(o => o.setName('confirmation').setDescription('Type PURGE CHANNEL MESSAGES to confirm').setMaxLength(40).setRequired(true)),
   new SlashCommandBuilder().setName('cleanup').setDescription('Preview members currently banned from another server, then optionally kick them.')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addStringOption(o => o.setName('serverlink').setDescription('Invite link to the reference server; bot must be in it').setMaxLength(200).setRequired(true))
@@ -524,6 +527,34 @@ async function handlePurgeAll(interaction) {
     }
   }
   await interaction.editReply(`Purge finished: ${totals.deleted} messages deleted across ${targets.length} accessible text channels/threads. ${totals.skipped} messages were skipped; ${totals.failedChannels} channels failed; ${unavailableScopes} thread scopes could not be listed. This cannot be undone. Private archived threads may require the bot's Manage Threads permission.`);
+}
+
+async function handlePurge(interaction) {
+  if (!hasAdminAccess(interaction)) return interaction.reply({ content: 'Only server administrators can use /purge.', ephemeral: true });
+  if (interaction.options.getString('confirmation', true) !== 'PURGE CHANNEL MESSAGES') {
+    return interaction.reply({ content: 'Confirmation did not match. To proceed, type exactly `PURGE CHANNEL MESSAGES`.', ephemeral: true });
+  }
+  const channel = interaction.channel;
+  if (!interaction.guild || !channel?.isTextBased?.() || typeof channel.messages?.fetch !== 'function') {
+    return interaction.reply({ content: '/purge must be used in a server text channel or thread.', ephemeral: true });
+  }
+  const botMember = interaction.guild.members.me ?? await interaction.guild.members.fetchMe().catch(() => null);
+  const permissions = botMember ? channel.permissionsFor(botMember) : null;
+  if (!permissions?.has(PermissionFlagsBits.ViewChannel)
+    || !permissions.has(PermissionFlagsBits.ReadMessageHistory)
+    || !permissions.has(PermissionFlagsBits.ManageMessages)) {
+    return interaction.reply({ content: 'The bot needs View Channel, Read Message History, and Manage Messages in this channel.', ephemeral: true });
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+  const totals = { deleted: 0, skipped: 0 };
+  try {
+    await purgeMessageHistory(channel, totals);
+  } catch (error) {
+    console.error(`Could not finish /purge in ${channel.id}:`, error);
+    return interaction.editReply(`Purge stopped after deleting ${totals.deleted} message(s); ${totals.skipped} could not be removed. Check the bot's channel permissions and logs.`);
+  }
+  await interaction.editReply(`Purge finished in <#${channel.id}>: ${totals.deleted} message(s) deleted; ${totals.skipped} could not be removed. Messages older than 14 days are deleted individually. This cannot be undone.`);
 }
 
 function cleanupInviteCode(value) {
@@ -1094,6 +1125,7 @@ client.on('interactionCreate', async interaction => {
       if (interaction.commandName === 'enable') return await handleEnable(interaction);
       if (interaction.commandName === 'droles') return await handleDRoles(interaction);
       if (interaction.commandName === 'purgeall') return await handlePurgeAll(interaction);
+      if (interaction.commandName === 'purge') return await handlePurge(interaction);
       if (interaction.commandName === 'cleanup') return await handleCleanup(interaction);
     }
     if (interaction.isButton()) {
