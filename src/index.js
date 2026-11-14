@@ -91,6 +91,13 @@ const commands = [
     .addAttachmentOption(o => o.setName('footer_thumbnail').setDescription('Small icon beside the footer').setRequired(false))
     .addStringOption(o => o.setName('link').setDescription('Optional HTTP/HTTPS link button below the embed').setMaxLength(512).setRequired(false))
     .addStringOption(o => o.setName('link_title').setDescription('Optional title for the link button (max 80 characters)').setMinLength(1).setMaxLength(80).setRequired(false)),
+  new SlashCommandBuilder().setName('hyperlink').setDescription('Build a Roblox URL template and a transparent short-link result.')
+    .addStringOption(o => o.setName('type').setDescription('Roblox link type')
+      .addChoices({ name: 'Profile', value: 'profile' }, { name: 'Group', value: 'group' }, { name: 'Private Server', value: 'private_server' }).setRequired(true))
+    .addStringOption(o => o.setName('link').setDescription('Shortened URL from https://shorturl.asia').setMaxLength(512).setRequired(true))
+    .addStringOption(o => o.setName('roblox_id').setDescription('User ID, community ID, or game ID for the selected type').setMaxLength(20).setRequired(true))
+    .addStringOption(o => o.setName('game_name').setDescription('Private server only; e.g. Adopt-Me or Murder-Mystery-2').setMaxLength(80).setRequired(false))
+    .addStringOption(o => o.setName('private_server_code').setDescription('Private server only; the link-code value').setMaxLength(128).setRequired(false)),
   new SlashCommandBuilder().setName('automod').setDescription('Configure automatic flag-word moderation for one channel.')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addChannelOption(o => o.setName('channel').setDescription('Channel to monitor').addChannelTypes(ChannelType.GuildText).setRequired(true))
@@ -210,6 +217,69 @@ async function handleEmbed(interaction) {
   }
   await interaction.channel.send({ embeds: [embed], ...(linkButton ? { components: [new ActionRowBuilder().addComponents(linkButton)] } : {}) });
   await interaction.reply({ content: 'Embed sent to this channel.', ephemeral: true });
+}
+
+async function handleHyperlink(interaction) {
+  const type = interaction.options.getString('type', true);
+  const linkInput = interaction.options.getString('link', true).trim();
+  const robloxId = interaction.options.getString('roblox_id', true).trim();
+  if (!/^\d{1,20}$/.test(robloxId)) {
+    return interaction.reply({ content: '`roblox_id` must contain only digits (up to 20 characters).', ephemeral: true });
+  }
+
+  let shortUrl;
+  try {
+    const parsed = new URL(linkInput);
+    if (parsed.protocol !== 'https:'
+      || !['shorturl.asia', 'www.shorturl.asia'].includes(parsed.hostname.toLowerCase())
+      || parsed.username || parsed.password || parsed.port
+      || parsed.search || parsed.hash
+      || !/^\/[A-Za-z0-9_-]{1,80}\/?$/.test(parsed.pathname)) {
+      throw new Error('Invalid short-link URL');
+    }
+    shortUrl = parsed.toString();
+  } catch {
+    return interaction.reply({ content: 'Enter an HTTPS short link from `shorturl.asia`, such as `https://shorturl.asia/fasj4`.', ephemeral: true });
+  }
+
+  let robloxUrl;
+  let typeLabel;
+  if (type === 'profile') {
+    typeLabel = 'Profile';
+    robloxUrl = `https://roblox.com/users/${robloxId}/profile`;
+  } else if (type === 'group') {
+    typeLabel = 'Group';
+    robloxUrl = `https://roblox.com/communities/${robloxId}/`;
+  } else if (type === 'private_server') {
+    typeLabel = 'Private server';
+    const rawGameName = interaction.options.getString('game_name')?.trim() ?? '';
+    const gameName = rawGameName.replace(/\s+/g, '-');
+    const privateServerCode = interaction.options.getString('private_server_code')?.trim() ?? '';
+    if (!/^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$/.test(gameName)) {
+      return interaction.reply({ content: 'For a private server, enter `game_name` using letters, numbers, and hyphens (for example `Adopt-Me`).', ephemeral: true });
+    }
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(privateServerCode)) {
+      return interaction.reply({ content: 'For a private server, enter a valid `private_server_code` using letters, numbers, hyphens, or underscores.', ephemeral: true });
+    }
+    robloxUrl = `https://roblox.com/games/${robloxId}/${gameName}?privateServerLinkCode=${encodeURIComponent(privateServerCode)}`;
+  } else {
+    return interaction.reply({ content: 'Choose Profile, Group, or Private Server.', ephemeral: true });
+  }
+
+  const content = [
+    '- Head over to https://shorturl.asia',
+    '- Put your link there',
+    '- Shorten it',
+    '- Copy the result',
+    '- Put the result in the `/hyperlink` `link` option',
+    '',
+    '**NOTE:** For a private server, use the game name you entered, for example `Adopt-Me` or `Murder-Mystery-2`.',
+    '',
+    `**${typeLabel} Roblox URL template:** \`${robloxUrl}\``,
+    `**Shortened URL (actual click destination):** [${shortUrl}](${shortUrl})`,
+    'The short link redirects wherever its owner configured it. Check that it opens the Roblox URL shown above before sharing.'
+  ].join('\n');
+  await interaction.reply({ content, allowedMentions: { parse: [] } });
 }
 
 async function handleWelcomer(interaction) {
@@ -1116,6 +1186,7 @@ client.on('interactionCreate', async interaction => {
   try {
     if (interaction.isChatInputCommand()) {
       if (interaction.commandName === 'embed') return await handleEmbed(interaction);
+      if (interaction.commandName === 'hyperlink') return await handleHyperlink(interaction);
       if (interaction.commandName === 'automod') return await handleAutoMod(interaction);
       if (interaction.commandName === 'ban') return await handleBan(interaction);
       if (interaction.commandName === 'ticket') return await handleTicketPanel(interaction);
