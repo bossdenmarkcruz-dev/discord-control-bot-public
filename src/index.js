@@ -2,7 +2,8 @@ import 'dotenv/config';
 import { randomUUID } from 'node:crypto';
 import {
   ActionRowBuilder, AttachmentBuilder, ButtonBuilder, ButtonStyle, ChannelType, Client, EmbedBuilder,
-  GatewayIntentBits, PermissionFlagsBits, REST, Routes, SlashCommandBuilder,
+  GatewayIntentBits, ModalBuilder, PermissionFlagsBits, REST, Routes, SlashCommandBuilder,
+  TextInputBuilder, TextInputStyle,
 } from 'discord.js';
 import Database from 'better-sqlite3';
 import sharp from 'sharp';
@@ -91,13 +92,7 @@ const commands = [
     .addAttachmentOption(o => o.setName('footer_thumbnail').setDescription('Small icon beside the footer').setRequired(false))
     .addStringOption(o => o.setName('link').setDescription('Optional HTTP/HTTPS link button below the embed').setMaxLength(512).setRequired(false))
     .addStringOption(o => o.setName('link_title').setDescription('Optional title for the link button (max 80 characters)').setMinLength(1).setMaxLength(80).setRequired(false)),
-  new SlashCommandBuilder().setName('hyperlink').setDescription('Build a Roblox URL template and a transparent short-link result.')
-    .addStringOption(o => o.setName('type').setDescription('Roblox link type')
-      .addChoices({ name: 'Profile', value: 'profile' }, { name: 'Group', value: 'group' }, { name: 'Private Server', value: 'private_server' }).setRequired(true))
-    .addStringOption(o => o.setName('link').setDescription('Shortened URL from https://shorturl.asia').setMaxLength(512).setRequired(true))
-    .addStringOption(o => o.setName('roblox_id').setDescription('User ID, community ID, or game ID for the selected type').setMaxLength(20).setRequired(true))
-    .addStringOption(o => o.setName('game_name').setDescription('Private server only; e.g. Adopt-Me or Murder-Mystery-2').setMaxLength(80).setRequired(false))
-    .addStringOption(o => o.setName('private_server_code').setDescription('Private server only; the link-code value').setMaxLength(128).setRequired(false)),
+  new SlashCommandBuilder().setName('hyperlink').setDescription('Show instructions and open the Roblox link generator.'),
   new SlashCommandBuilder().setName('automod').setDescription('Configure automatic flag-word moderation for one channel.')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addChannelOption(o => o.setName('channel').setDescription('Channel to monitor').addChannelTypes(ChannelType.GuildText).setRequired(true))
@@ -220,9 +215,68 @@ async function handleEmbed(interaction) {
 }
 
 async function handleHyperlink(interaction) {
-  const type = interaction.options.getString('type', true);
-  const linkInput = interaction.options.getString('link', true).trim();
-  const robloxId = interaction.options.getString('roblox_id', true).trim();
+  const guide = new EmbedBuilder().setColor(0x5865F2).setTitle('Roblox Link Generator')
+    .setDescription([
+      '1. Go to https://shorturl.asia and paste the Roblox link you want to share.',
+      '2. Shorten the link, copy the result, then choose a link type below.',
+      '3. Paste the shortened URL into the form that opens.',
+      '',
+      '**Private server note:** Enter the game name you want in the URL, such as `Adopt-Me` or `Murder-Mystery-2`. Spaces are changed to hyphens.',
+      '',
+      'The result shows the Roblox URL template and the shorturl.asia destination separately. Check that the shortened link opens the Roblox URL before sharing.'
+    ].join('\n'));
+  const buttons = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('hyperlink:profile').setLabel('Profile').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('hyperlink:group').setLabel('Group').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('hyperlink:private_server').setLabel('Private Server').setStyle(ButtonStyle.Primary),
+  );
+  await interaction.reply({ embeds: [guide], components: [buttons], ephemeral: true });
+}
+
+async function handleHyperlinkButton(interaction) {
+  const type = interaction.customId.slice('hyperlink:'.length);
+  const forms = {
+    profile: {
+      title: 'Roblox Profile Link',
+      fields: [
+        ['short_link', 'Short URL from shorturl.asia', 'https://shorturl.asia/fasj4', 512],
+        ['roblox_id', 'Roblox user ID', '6324468124', 20],
+      ],
+    },
+    group: {
+      title: 'Roblox Group Link',
+      fields: [
+        ['short_link', 'Short URL from shorturl.asia', 'https://shorturl.asia/fasj4', 512],
+        ['roblox_id', 'Roblox community ID', '6324468124', 20],
+      ],
+    },
+    private_server: {
+      title: 'Roblox Private Server Link',
+      fields: [
+        ['short_link', 'Short URL from shorturl.asia', 'https://shorturl.asia/fasj4', 512],
+        ['roblox_id', 'Roblox game ID', '142823291', 20],
+        ['game_name', 'Game name (use hyphens)', 'Adopt-Me', 80],
+        ['private_server_code', 'Private server link code', 'Paste the code from your server link', 128],
+      ],
+    },
+  };
+  const form = forms[type];
+  if (!form) return interaction.reply({ content: 'Choose a link type from the `/hyperlink` popup first.', ephemeral: true });
+
+  const modal = new ModalBuilder().setCustomId(`hyperlink:submit:${type}`).setTitle(form.title)
+    .addComponents(...form.fields.map(([id, label, placeholder, maxLength]) =>
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId(id).setLabel(label).setStyle(TextInputStyle.Short)
+          .setPlaceholder(placeholder).setRequired(true).setMinLength(1).setMaxLength(maxLength)
+      )
+    ));
+  await interaction.showModal(modal);
+}
+
+async function handleHyperlinkModal(interaction) {
+  const type = interaction.customId.slice('hyperlink:submit:'.length);
+  const linkInput = interaction.fields.getTextInputValue('short_link').trim();
+  const robloxId = interaction.fields.getTextInputValue('roblox_id').trim();
   if (!/^\d{1,20}$/.test(robloxId)) {
     return interaction.reply({ content: '`roblox_id` must contain only digits (up to 20 characters).', ephemeral: true });
   }
@@ -252,9 +306,9 @@ async function handleHyperlink(interaction) {
     robloxUrl = `https://roblox.com/communities/${robloxId}/`;
   } else if (type === 'private_server') {
     typeLabel = 'Private server';
-    const rawGameName = interaction.options.getString('game_name')?.trim() ?? '';
+    const rawGameName = interaction.fields.getTextInputValue('game_name').trim();
     const gameName = rawGameName.replace(/\s+/g, '-');
-    const privateServerCode = interaction.options.getString('private_server_code')?.trim() ?? '';
+    const privateServerCode = interaction.fields.getTextInputValue('private_server_code').trim();
     if (!/^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$/.test(gameName)) {
       return interaction.reply({ content: 'For a private server, enter `game_name` using letters, numbers, and hyphens (for example `Adopt-Me`).', ephemeral: true });
     }
@@ -267,14 +321,6 @@ async function handleHyperlink(interaction) {
   }
 
   const content = [
-    '- Head over to https://shorturl.asia',
-    '- Put your link there',
-    '- Shorten it',
-    '- Copy the result',
-    '- Put the result in the `/hyperlink` `link` option',
-    '',
-    '**NOTE:** For a private server, use the game name you entered, for example `Adopt-Me` or `Murder-Mystery-2`.',
-    '',
     `**${typeLabel} Roblox URL template:** \`${robloxUrl}\``,
     `**Shortened URL (actual click destination):** [${shortUrl}](${shortUrl})`,
     'The short link redirects wherever its owner configured it. Check that it opens the Roblox URL shown above before sharing.'
@@ -1200,8 +1246,12 @@ client.on('interactionCreate', async interaction => {
       if (interaction.commandName === 'cleanup') return await handleCleanup(interaction);
     }
     if (interaction.isButton()) {
+      if (interaction.customId.startsWith('hyperlink:')) return await handleHyperlinkButton(interaction);
       if (interaction.customId.startsWith('cleanup:')) return await handleCleanupButton(interaction);
       return await handleTicketButton(interaction);
+    }
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('hyperlink:submit:')) {
+      return await handleHyperlinkModal(interaction);
     }
   } catch (error) {
     console.error('Interaction failed:', error);
