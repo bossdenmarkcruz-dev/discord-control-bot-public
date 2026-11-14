@@ -221,9 +221,8 @@ async function handleHyperlink(interaction) {
       '2. Shorten the link, copy the result, then choose a link type below.',
       '3. Paste the shortened URL into the form that opens.',
       '',
-      '**Private server note:** Enter the game name you want in the URL, such as `Adopt-Me` or `Murder-Mystery-2`. Spaces are changed to hyphens.',
-      '',
-      'The result shows the Roblox URL template and the shorturl.asia destination separately. Check that the shortened link opens the Roblox URL before sharing.'
+      'No Roblox ID or game details are needed; they are read from the original URL when the short link redirects.',
+      'The bot only accepts a short link that currently redirects to a matching official Roblox URL. The result message is just the formatted link.'
     ].join('\n'));
   const buttons = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('hyperlink:profile').setLabel('Profile').setStyle(ButtonStyle.Primary),
@@ -236,51 +235,72 @@ async function handleHyperlink(interaction) {
 async function handleHyperlinkButton(interaction) {
   const type = interaction.customId.slice('hyperlink:'.length);
   const forms = {
-    profile: {
-      title: 'Roblox Profile Link',
-      fields: [
-        ['short_link', 'Short URL from shorturl.asia', 'https://shorturl.asia/fasj4', 512],
-        ['roblox_id', 'Roblox user ID', '6324468124', 20],
-      ],
-    },
-    group: {
-      title: 'Roblox Group Link',
-      fields: [
-        ['short_link', 'Short URL from shorturl.asia', 'https://shorturl.asia/fasj4', 512],
-        ['roblox_id', 'Roblox community ID', '6324468124', 20],
-      ],
-    },
-    private_server: {
-      title: 'Roblox Private Server Link',
-      fields: [
-        ['short_link', 'Short URL from shorturl.asia', 'https://shorturl.asia/fasj4', 512],
-        ['roblox_id', 'Roblox game ID', '142823291', 20],
-        ['game_name', 'Game name (use hyphens)', 'Adopt-Me', 80],
-        ['private_server_code', 'Private server link code', 'Paste the code from your server link', 128],
-      ],
-    },
+    profile: { title: 'Roblox Profile Link' },
+    group: { title: 'Roblox Group Link' },
+    private_server: { title: 'Roblox Private Server Link' },
   };
   const form = forms[type];
   if (!form) return interaction.reply({ content: 'Choose a link type from the `/hyperlink` popup first.', ephemeral: true });
 
   const modal = new ModalBuilder().setCustomId(`hyperlink:submit:${type}`).setTitle(form.title)
-    .addComponents(...form.fields.map(([id, label, placeholder, maxLength]) =>
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder().setCustomId(id).setLabel(label).setStyle(TextInputStyle.Short)
-          .setPlaceholder(placeholder).setRequired(true).setMinLength(1).setMaxLength(maxLength)
-      )
+    .addComponents(new ActionRowBuilder().addComponents(
+      new TextInputBuilder().setCustomId('short_link').setLabel('Short URL from shorturl.asia')
+        .setStyle(TextInputStyle.Short).setPlaceholder('https://shorturl.asia/fasj4')
+        .setRequired(true).setMinLength(1).setMaxLength(512)
     ));
   await interaction.showModal(modal);
+}
+
+async function resolveRobloxRedirect(shortUrl) {
+  const shortHosts = new Set(['shorturl.asia', 'www.shorturl.asia']);
+  const robloxHosts = new Set(['roblox.com', 'www.roblox.com']);
+  let current = new URL(shortUrl);
+  for (let redirects = 0; redirects < 6; redirects++) {
+    const response = await fetch(current, {
+      method: 'GET', redirect: 'manual', signal: AbortSignal.timeout(8000),
+      headers: { 'user-agent': 'DiscordControlBot/1.0 Roblox-link-check' },
+    });
+    const location = response.headers.get('location');
+    if (response.body) await response.body.cancel().catch(() => {});
+    if (![301, 302, 303, 307, 308].includes(response.status) || !location) {
+      throw new Error('Short link did not return an HTTP redirect.');
+    }
+    const next = new URL(location, current);
+    if (next.protocol !== 'https:' || next.username || next.password || next.port) {
+      throw new Error('Redirect URL is not a safe HTTPS URL.');
+    }
+    const hostname = next.hostname.toLowerCase();
+    if (robloxHosts.has(hostname)) return next;
+    if (!shortHosts.has(hostname)) throw new Error('Short link redirects outside the expected domains.');
+    current = next;
+  }
+  throw new Error('Too many redirects.');
+}
+
+function canonicalRobloxUrl(type, destination) {
+  const host = destination.hostname.toLowerCase();
+  if (!['roblox.com', 'www.roblox.com'].includes(host) || destination.protocol !== 'https:') return null;
+  if (type === 'profile') {
+    const match = destination.pathname.match(/^\/users\/(\d{1,20})\/profile\/?$/);
+    return match && !destination.search && !destination.hash ? `https://roblox.com/users/${match[1]}/profile` : null;
+  }
+  if (type === 'group') {
+    const match = destination.pathname.match(/^\/communities\/(\d{1,20})\/?$/);
+    return match && !destination.search && !destination.hash ? `https://roblox.com/communities/${match[1]}/` : null;
+  }
+  if (type === 'private_server') {
+    const match = destination.pathname.match(/^\/games\/(\d{1,20})\/([A-Za-z0-9]+(?:-[A-Za-z0-9]+)*)\/?$/);
+    const codes = destination.searchParams.getAll('privateServerLinkCode');
+    const queryKeys = [...destination.searchParams.keys()];
+    if (!match || destination.hash || codes.length !== 1 || queryKeys.length !== 1 || !/^[A-Za-z0-9_-]{1,128}$/.test(codes[0])) return null;
+    return `https://roblox.com/games/${match[1]}/${match[2]}?privateServerLinkCode=${encodeURIComponent(codes[0])}`;
+  }
+  return null;
 }
 
 async function handleHyperlinkModal(interaction) {
   const type = interaction.customId.slice('hyperlink:submit:'.length);
   const linkInput = interaction.fields.getTextInputValue('short_link').trim();
-  const robloxId = interaction.fields.getTextInputValue('roblox_id').trim();
-  if (!/^\d{1,20}$/.test(robloxId)) {
-    return interaction.reply({ content: '`roblox_id` must contain only digits (up to 20 characters).', ephemeral: true });
-  }
-
   let shortUrl;
   try {
     const parsed = new URL(linkInput);
@@ -296,36 +316,21 @@ async function handleHyperlinkModal(interaction) {
     return interaction.reply({ content: 'Enter an HTTPS short link from `shorturl.asia`, such as `https://shorturl.asia/fasj4`.', ephemeral: true });
   }
 
-  let robloxUrl;
-  let typeLabel;
-  if (type === 'profile') {
-    typeLabel = 'Profile';
-    robloxUrl = `https://roblox.com/users/${robloxId}/profile`;
-  } else if (type === 'group') {
-    typeLabel = 'Group';
-    robloxUrl = `https://roblox.com/communities/${robloxId}/`;
-  } else if (type === 'private_server') {
-    typeLabel = 'Private server';
-    const rawGameName = interaction.fields.getTextInputValue('game_name').trim();
-    const gameName = rawGameName.replace(/\s+/g, '-');
-    const privateServerCode = interaction.fields.getTextInputValue('private_server_code').trim();
-    if (!/^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$/.test(gameName)) {
-      return interaction.reply({ content: 'For a private server, enter `game_name` using letters, numbers, and hyphens (for example `Adopt-Me`).', ephemeral: true });
-    }
-    if (!/^[A-Za-z0-9_-]{1,128}$/.test(privateServerCode)) {
-      return interaction.reply({ content: 'For a private server, enter a valid `private_server_code` using letters, numbers, hyphens, or underscores.', ephemeral: true });
-    }
-    robloxUrl = `https://roblox.com/games/${robloxId}/${gameName}?privateServerLinkCode=${encodeURIComponent(privateServerCode)}`;
-  } else {
-    return interaction.reply({ content: 'Choose Profile, Group, or Private Server.', ephemeral: true });
+  if (!['profile', 'group', 'private_server'].includes(type)) {
+    return interaction.reply({ content: 'Choose a link type from the `/hyperlink` popup first.', ephemeral: true });
   }
 
-  const content = [
-    `**${typeLabel} Roblox URL template:** \`${robloxUrl}\``,
-    `**Shortened URL (actual click destination):** [${shortUrl}](${shortUrl})`,
-    'The short link redirects wherever its owner configured it. Check that it opens the Roblox URL shown above before sharing.'
-  ].join('\n');
-  await interaction.reply({ content, allowedMentions: { parse: [] } });
+  let destination;
+  try {
+    destination = await resolveRobloxRedirect(shortUrl);
+  } catch {
+    return interaction.reply({ content: 'Could not verify this short link. Use one that currently redirects to the matching official Roblox page.', ephemeral: true });
+  }
+  const robloxUrl = canonicalRobloxUrl(type, destination);
+  if (!robloxUrl) {
+    return interaction.reply({ content: 'That short link does not currently redirect to a matching Roblox profile, group, or private-server URL.', ephemeral: true });
+  }
+  await interaction.reply({ content: `[${robloxUrl}](${shortUrl})`, allowedMentions: { parse: [] } });
 }
 
 async function handleWelcomer(interaction) {
