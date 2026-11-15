@@ -53,6 +53,9 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS welcome_settings (
     guild_id TEXT PRIMARY KEY, channel_id TEXT NOT NULL, config_json TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS autorole_settings (
+    guild_id TEXT PRIMARY KEY, role_id TEXT NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS invite_stats (
     guild_id TEXT NOT NULL, inviter_id TEXT NOT NULL,
     invited_count INTEGER NOT NULL DEFAULT 0, left_count INTEGER NOT NULL DEFAULT 0,
@@ -128,6 +131,13 @@ const commands = [
     .addStringOption(o => o.setName('link_name').setDescription('Optional clickable button name (defaults to Open Link)').setMaxLength(80).setRequired(false)),
   new SlashCommandBuilder().setName('invites').setDescription('Show the tracked invites for a server member.')
     .addUserOption(o => o.setName('user').setDescription('Member whose invite totals you want to check').setRequired(true)),
+  new SlashCommandBuilder().setName('autorole').setDescription('Give a selected role to every new member who joins.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageRoles)
+    .addRoleOption(o => o.setName('role').setDescription('Role to assign automatically to new members').setRequired(true)),
+  new SlashCommandBuilder().setName('roleall').setDescription('Give a selected role to all current server members.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addRoleOption(o => o.setName('role').setDescription('Role to assign to current members').setRequired(true))
+    .addStringOption(o => o.setName('confirmation').setDescription('Type ADD ROLE TO ALL MEMBERS to confirm').setMaxLength(40).setRequired(true)),
   new SlashCommandBuilder().setName('disable').setDescription('Emergency-lock public text channels against member messages.')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
   new SlashCommandBuilder().setName('enable').setDescription('Restore text-channel send permissions saved by /disable.')
@@ -546,6 +556,80 @@ async function handleDRoles(interaction) {
     return interaction.editReply(`Role removal stopped while listing members. ${changedMembers} members were updated; check the Server Members intent and bot logs, then retry if needed.`);
   }
   await interaction.editReply(`Removed Administrator roles from ${changedMembers} members. Skipped ${skippedMembers} protected account(s) (command user, server owner, and bot). ${failedMembers} members could not be changed; check Manage Roles and move the bot role above those roles.`);
+}
+
+async function roleAssignmentError(guild, role) {
+  if (role.id === guild.id || role.managed) return 'Choose a regular, manually assignable role.';
+  if (role.permissions.has(PermissionFlagsBits.Administrator)) return 'For safety, roles with Administrator permission cannot be assigned automatically or to everyone.';
+  const botMember = guild.members.me ?? await guild.members.fetchMe().catch(() => null);
+  if (!botMember?.permissions.has(PermissionFlagsBits.ManageRoles)) return 'The bot needs Manage Roles permission.';
+  if (role.position >= botMember.roles.highest.position) return 'Move the bot role above the selected role, then try again.';
+  return null;
+}
+
+async function handleAutorole(interaction) {
+  if (!hasPermission(interaction.member, PermissionFlagsBits.ManageRoles)) {
+    return interaction.reply({ content: 'You need Manage Roles permission to configure `/autorole`.', ephemeral: true });
+  }
+  const role = interaction.options.getRole('role', true);
+  const error = await roleAssignmentError(interaction.guild, role);
+  if (error) return interaction.reply({ content: error, ephemeral: true });
+  db.prepare(`INSERT INTO autorole_settings(guild_id, role_id) VALUES(?, ?)
+    ON CONFLICT(guild_id) DO UPDATE SET role_id=excluded.role_id`).run(interaction.guildId, role.id);
+  await interaction.reply({
+    content: `New members will automatically receive <@&${role.id}>. This setting survives bot restarts.`,
+    allowedMentions: { parse: [] }, ephemeral: true,
+  });
+}
+
+async function handleRoleAll(interaction) {
+  if (!isAdmin(interaction.member)) {
+    return interaction.reply({ content: 'Only server administrators can use `/roleall`.', ephemeral: true });
+  }
+  if (interaction.options.getString('confirmation', true) !== 'ADD ROLE TO ALL MEMBERS') {
+    return interaction.reply({ content: 'Confirmation did not match. Type exactly `ADD ROLE TO ALL MEMBERS` to proceed.', ephemeral: true });
+  }
+  const role = interaction.options.getRole('role', true);
+  await interaction.deferReply({ ephemeral: true });
+  const roleError = await roleAssignmentError(interaction.guild, role);
+  if (roleError) return interaction.editReply(roleError);
+
+  let members;
+  try {
+    members = await interaction.guild.members.fetch();
+  } catch (error) {
+    console.error('Could not fetch members for /roleall:', error);
+    return interaction.editReply('Could not list server members. Check that Server Members Intent is enabled and retry.');
+  }
+  const targets = [...members.values()].filter(member => !member.roles.cache.has(role.id));
+  const alreadyHadRole = members.size - targets.length;
+  if (!targets.length) return interaction.editReply({
+    content: `All ${members.size} current members already have <@&${role.id}>.`, allowedMentions: { parse: [] },
+  });
+
+  let assigned = 0;
+  let failed = 0;
+  const batchSize = 5;
+  for (let offset = 0; offset < targets.length; offset += batchSize) {
+    const batch = targets.slice(offset, offset + batchSize);
+    const results = await Promise.allSettled(batch.map(member =>
+      member.roles.add(role, `Bulk role assignment by ${interaction.user.tag}`)
+    ));
+    for (const result of results) {
+      if (result.status === 'fulfilled') assigned += 1;
+      else failed += 1;
+    }
+    const completed = Math.min(offset + batch.length, targets.length);
+    if (completed < targets.length && completed % 100 < batchSize) {
+      await interaction.editReply({
+        content: `Assigning <@&${role.id}>: ${completed}/${targets.length} processed.`, allowedMentions: { parse: [] },
+      }).catch(() => {});
+    }
+  }
+  await interaction.editReply({
+    content: `Added <@&${role.id}> to ${assigned} of ${targets.length} targeted members. ${alreadyHadRole} already had it; ${failed} could not be updated due to role hierarchy or Discord permissions.`,
+    allowedMentions: { parse: [] },
+  });
 }
 
 async function collectPurgeTargets(guild) {
@@ -1213,6 +1297,23 @@ client.once('ready', async () => {
   setInterval(unbanExpired, 60_000).unref();
 });
 client.on('guildCreate', guild => snapshotInvites(guild));
+async function assignAutorole(member) {
+  const setting = db.prepare('SELECT role_id FROM autorole_settings WHERE guild_id = ?').get(member.guild.id);
+  if (!setting || member.roles.cache.has(setting.role_id)) return;
+  const role = member.guild.roles.cache.get(setting.role_id)
+    ?? await member.guild.roles.fetch(setting.role_id).catch(() => null);
+  if (!role) {
+    db.prepare('DELETE FROM autorole_settings WHERE guild_id = ?').run(member.guild.id);
+    console.warn(`Removed missing autorole configuration for guild ${member.guild.id}.`);
+    return;
+  }
+  const error = await roleAssignmentError(member.guild, role);
+  if (error) {
+    console.error(`Could not assign autorole in guild ${member.guild.id}: ${error}`);
+    return;
+  }
+  await member.roles.add(role, 'Configured autorole for new members');
+}
 async function processMemberJoin(member) {
   const guildId = member.guild.id;
   const previous = inviteJoinQueues.get(guildId) ?? Promise.resolve();
@@ -1228,7 +1329,10 @@ async function processMemberJoin(member) {
     if (inviteJoinQueues.get(guildId) === current) inviteJoinQueues.delete(guildId);
   }
 }
-client.on('guildMemberAdd', member => processMemberJoin(member).catch(error => console.error('Member join processing failed:', error)));
+client.on('guildMemberAdd', member => {
+  assignAutorole(member).catch(error => console.error('Autorole assignment failed:', error));
+  processMemberJoin(member).catch(error => console.error('Member join processing failed:', error));
+});
 client.on('guildMemberRemove', member => {
   try { recordInviteLeave(member); }
   catch (error) { console.error('Invite departure tracking failed:', error); }
@@ -1243,6 +1347,8 @@ client.on('interactionCreate', async interaction => {
       if (interaction.commandName === 'ticket') return await handleTicketPanel(interaction);
       if (interaction.commandName === 'welcomer') return await handleWelcomer(interaction);
       if (interaction.commandName === 'invites') return await handleInvites(interaction);
+      if (interaction.commandName === 'autorole') return await handleAutorole(interaction);
+      if (interaction.commandName === 'roleall') return await handleRoleAll(interaction);
       if (interaction.commandName === 'disable') return await handleDisable(interaction);
       if (interaction.commandName === 'enable') return await handleEnable(interaction);
       if (interaction.commandName === 'droles') return await handleDRoles(interaction);
