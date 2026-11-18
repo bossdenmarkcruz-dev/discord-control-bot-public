@@ -312,7 +312,7 @@ async function handleHyperlinkModal(interaction) {
     robloxUrl = `https://roblox.com/games/142823291/${gameName}?privateServerLinkCode=152589744669899620445986250515310`;
   }
   const visibleRobloxUrl = robloxUrl.replace(/^https:\/\//, '');
-  await interaction.reply({ content: `[${visibleRobloxUrl}](${shortUrl})`, allowedMentions: { parse: [] } });
+  await interaction.reply({ content: `[${visibleRobloxUrl}](${shortUrl})`, allowedMentions: { parse: [] }, ephemeral: true });
 }
 
 async function handleWelcomer(interaction) {
