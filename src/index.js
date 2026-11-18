@@ -1038,7 +1038,7 @@ async function renderWelcomeCard(member, memberCount, config) {
     ? `<image href="data:image/png;base64,${serverIconBuffer.toString('base64')}" x="337" y="275" width="30" height="30" preserveAspectRatio="xMidYMid slice" clip-path="url(#serverClip)"/>`
     : `<circle cx="352" cy="290" r="15" fill="${accent}"/>`;
   const name = escapeXml(member.displayName || member.user.username);
-  const svg = Buffer.from(`<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg"><defs><clipPath id="avatarClip"><circle cx="174" cy="200" r="92"/></clipPath><clipPath id="serverClip"><circle cx="352" cy="290" r="15"/></clipPath></defs><rect x="6" y="6" width="948" height="388" rx="28" fill="#090b12" fill-opacity=".42" stroke="#fff" stroke-opacity=".82" stroke-width="5"/><circle cx="174" cy="200" r="101" fill="#111722" stroke="${accent}" stroke-width="6"/>${avatarNode}<text x="326" y="146" fill="${accent}" font-family="Arial,sans-serif" font-size="22" font-weight="700" letter-spacing="5">WELCOME</text><rect x="326" y="162" width="175" height="4" rx="2" fill="${accent}"/><text x="326" y="235" fill="#ffffff" font-family="Arial,sans-serif" font-size="54" font-weight="700" textLength="530" lengthAdjust="spacingAndGlyphs">${name}</text>${serverIconNode}<text x="382" y="298" fill="#d8dce5" font-family="Arial,sans-serif" font-size="23" textLength="490" lengthAdjust="spacingAndGlyphs">INJURIES • Member #${memberCount}</text><text x="326" y="344" fill="#9ba4b5" font-family="Arial,sans-serif" font-size="16" letter-spacing="2">WELCOME TO THE COMMUNITY</text></svg>`);
+  const svg = Buffer.from(`<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg"><defs><clipPath id="avatarClip"><circle cx="174" cy="200" r="92"/></clipPath><clipPath id="serverClip"><circle cx="352" cy="290" r="15"/></clipPath></defs><rect x="6" y="6" width="948" height="388" rx="28" fill="#090b12" fill-opacity=".42" stroke="#fff" stroke-opacity=".82" stroke-width="5"/><circle cx="174" cy="200" r="101" fill="#111722" stroke="${accent}" stroke-width="6"/>${avatarNode}<text x="326" y="146" fill="${accent}" font-family="Arial,sans-serif" font-size="22" font-weight="700" letter-spacing="5">WELCOME</text><rect x="326" y="162" width="175" height="4" rx="2" fill="${accent}"/><text x="326" y="235" fill="#ffffff" font-family="Arial,sans-serif" font-size="54" font-weight="700" textLength="530" lengthAdjust="spacingAndGlyphs">${name}</text>${serverIconNode}<text x="382" y="298" fill="#d8dce5" font-family="Arial,sans-serif" font-size="23" textLength="490" lengthAdjust="spacingAndGlyphs">SPLUNK • Member #${memberCount}</text><text x="326" y="344" fill="#9ba4b5" font-family="Arial,sans-serif" font-size="16" letter-spacing="2">WELCOME TO THE COMMUNITY</text></svg>`);
   return background.composite([{ input: svg, top: 0, left: 0 }]).png().toBuffer();
 }
 
@@ -1050,14 +1050,13 @@ async function sendWelcome(member, inviter) {
   const config = JSON.parse(row.config_json);
   const links = config.links ?? {};
   const memberCount = member.guild.memberCount;
-  const memberName = member.displayName || member.user.username;
   const inviterName = inviter ? (inviter.globalName || inviter.username) : null;
   const joinedTimestamp = Math.floor((member.joinedAt?.getTime() || Date.now()) / 1000);
-  const description = `Hey @${memberName}! You're member #${memberCount}. Joined on <t:${joinedTimestamp}:D>.\nInvited by ${inviterName ? `@${inviterName}` : 'Unknown (invite could not be identified)'}`;
+  const description = `You're member #${memberCount}. Joined on <t:${joinedTimestamp}:D>.\nInvited by ${inviterName || 'Unknown (invite could not be identified)'}`;
   const serverIcon = member.guild.iconURL({ extension: 'png', size: 128 });
   const memberAvatar = member.user.displayAvatarURL({ extension: 'png', size: 128 });
   const embed = new EmbedBuilder().setColor(config.color).setTitle('Welcome!').setDescription(description)
-    .setAuthor({ name: `INJURIES • Member #${memberCount}`, ...(serverIcon ? { iconURL: serverIcon } : {}) })
+    .setAuthor({ name: `SPLUNK • Member #${memberCount}`, ...(serverIcon ? { iconURL: serverIcon } : {}) })
     .setThumbnail(memberAvatar);
   if (config.footer || config.footerThumbnail) embed.setFooter({ text: config.footer || '\u200b', ...(config.footerThumbnail ? { iconURL: config.footerThumbnail } : {}) });
   const channelDefinitions = [
@@ -1101,7 +1100,7 @@ async function sendWelcome(member, inviter) {
       console.warn('Stored welcomer link is invalid; sending without the button.', error.message);
     }
   }
-  await channel.send({ embeds: [embed], ...(files.length ? { files } : {}), ...(components.length ? { components } : {}) });
+  await channel.send({ content: `<@${member.id}>`, allowedMentions: { users: [member.id] }, embeds: [embed], ...(files.length ? { files } : {}), ...(components.length ? { components } : {}) });
 }
 
 async function handleAutoMod(interaction) {
