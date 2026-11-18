@@ -231,7 +231,8 @@ async function handleHyperlink(interaction) {
       '2. Shorten the link, copy the result, then choose a link type below.',
       '3. Paste the short link into the form. For Private Server, also enter the game name; spaces become hyphens.',
       '',
-      'Profile and Group use the configured Roblox URL templates. Private Server uses the configured game ID and server code.',
+      'Profile needs only the short link. Group and Private Server also ask for a name, which is added to the Roblox URL with hyphens.',
+      'Group uses ID 6324468134; Private Server uses game ID 142823291 and the configured server code.',
       'On success, the bot posts only the formatted Markdown link.'
     ].join('\n'));
   const buttons = new ActionRowBuilder().addComponents(
@@ -257,10 +258,12 @@ async function handleHyperlinkButton(interaction) {
       .setStyle(TextInputStyle.Short).setPlaceholder('https://shorturl.asia/fasj4')
       .setRequired(true).setMinLength(1).setMaxLength(512)
   )];
-  if (type === 'private_server') {
+  if (type === 'group' || type === 'private_server') {
+    const isGroup = type === 'group';
     fields.push(new ActionRowBuilder().addComponents(
-      new TextInputBuilder().setCustomId('game_name').setLabel('Game-Name (example: Adopt-Me)')
-        .setStyle(TextInputStyle.Short).setPlaceholder('Murder-Mystery-2')
+      new TextInputBuilder().setCustomId(isGroup ? 'group_name' : 'game_name')
+        .setLabel(isGroup ? 'Group-Name' : 'Game-Name (example: Adopt-Me)')
+        .setStyle(TextInputStyle.Short).setPlaceholder(isGroup ? 'Group-Name' : 'Murder-Mystery-2')
         .setRequired(true).setMinLength(1).setMaxLength(80)
     ));
   }
@@ -294,7 +297,12 @@ async function handleHyperlinkModal(interaction) {
   if (type === 'profile') {
     robloxUrl = 'https://roblox.com/users/6324468124/profile';
   } else if (type === 'group') {
-    robloxUrl = 'https://roblox.com/communities/6324468124/';
+    const rawGroupName = interaction.fields.getTextInputValue('group_name').trim();
+    const groupName = rawGroupName.replace(/\s+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+    if (!/^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$/.test(groupName)) {
+      return interaction.reply({ content: 'Enter a group name using letters, numbers, and hyphens.', ephemeral: true });
+    }
+    robloxUrl = `https://roblox.com/communities/6324468134/${groupName}`;
   } else {
     const rawGameName = interaction.fields.getTextInputValue('game_name').trim();
     const gameName = rawGameName.replace(/\s+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
